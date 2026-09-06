@@ -26,6 +26,7 @@ the current stage.
 
 - `perception/rgbd_loader.py`: reads offline RGB-D data and camera intrinsics.
 - `perception/apple_mask.py`: exposes `AppleMaskDetector.detect(rgb) -> mask`.
+- `perception/realsense_camera.py`: captures aligned D435i RGB-D frames.
 - `perception/mask_process.py`: combines segmentation and valid-depth masks.
 - `perception/pointcloud.py`: projects masked depth and samples model input.
 - `grasp/graspnet_runner.py`: loads GraspNet and returns a `GraspGroup`.
@@ -115,3 +116,45 @@ yolo = YOLOAppleDetector("/path/to/apple-seg.pt")
 detector = AppleMaskDetector(predictor=yolo)
 apple_mask = detector.detect(rgb)
 ```
+
+## Intel RealSense D435i
+
+`perception/realsense_camera.py` supplies depth aligned to the color image in
+the same format as the offline loader:
+
+- RGB: NumPy `uint8`, `(H, W, 3)`, RGB channel order.
+- Depth: NumPy `uint16`, `(H, W)`, millimetres.
+- `camera.intrinsic`: aligned color-camera `3x3` intrinsic matrix.
+- `camera.depth_scale`: `0.001` metres per millimetre for point-cloud creation.
+
+Install the RealSense Python binding and the OpenCV viewer dependency:
+
+```bash
+pip install pyrealsense2 opencv-python
+```
+
+Connect the D435i over USB 3 and verify both live streams:
+
+```bash
+python test_realsense.py
+```
+
+Press `q` or `Esc` to close the RGB and depth windows.
+
+The end-to-end GraspNet test supports both sources:
+
+```bash
+# Existing offline example
+python test_graspnet_runner.py --source file
+
+# Capture one aligned D435i frame and run grasp inference
+python test_graspnet_runner.py --source camera
+
+# D435i plus an existing YOLOv8-seg apple checkpoint
+python test_graspnet_runner.py --source camera \
+  --yolo-model /path/to/apple-seg.pt \
+  --yolo-device 0
+```
+
+RealSense acquisition stops before grasp inference begins. Mechanical-arm
+control and camera-to-robot calibration remain outside the current stage.

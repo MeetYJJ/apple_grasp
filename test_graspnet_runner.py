@@ -1,6 +1,8 @@
-"""Offline end-to-end smoke test using the official GraspNet example data."""
+"""File/camera end-to-end smoke test for the apple grasp pipeline."""
 
+import argparse
 from pathlib import Path
+from typing import Optional, Tuple
 
 import torch
 
@@ -9,7 +11,9 @@ from grasp.graspnet_runner import GraspNetRunner
 from perception.apple_mask import AppleMaskDetector
 from perception.mask_process import build_valid_mask, load_mask
 from perception.pointcloud import create_point_cloud, sample_point_cloud
-from perception.rgbd_loader import load_rgbd
+from perception.realsense_camera import RealSenseCamera
+from perception.rgbd_loader import RGBDFrame, load_rgbd
+from perception.yolo_apple_detector import YOLOAppleDetector
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -20,12 +24,40 @@ DATA_DIR = BASELINE_DIR / "doc" / "example_data"
 OUTPUT_PATH = PROJECT_ROOT / "output" / "best_grasp.npy"
 
 
-def main() -> None:
-    frame = load_rgbd(DATA_DIR)
+def load_source(source: str) -> Tuple[RGBDFrame, Optional[Path]]:
+    """Return a source-independent RGBDFrame and optional workspace mask path."""
 
-    apple_mask = AppleMaskDetector().detect(frame.color)
-    workspace_mask_path = DATA_DIR / "workspace_mask.png"
-    if workspace_mask_path.is_file():
+    if source == "file":
+        return load_rgbd(DATA_DIR), DATA_DIR / "workspace_mask.png"
+    if source == "camera":
+        with RealSenseCamera() as camera:
+            rgb, depth = camera.get_frame()
+            frame = RGBDFrame(
+                color=rgb,
+                depth=depth,
+                intrinsic=camera.intrinsic.copy(),
+                depth_scale=camera.depth_scale,
+            )
+            print("RealSense: {} (serial={})".format(
+                camera.device_name, camera.serial_number
+            ))
+        return frame, None
+    raise ValueError("Unsupported source: {}".format(source))
+
+
+def main(
+    source: str = "file",
+    yolo_model: Optional[str] = None,
+    yolo_device: Optional[str] = None,
+) -> None:
+    frame, workspace_mask_path = load_source(source)
+    print("[0/4] RGB-D source: {}; shape={}".format(source, frame.depth.shape))
+
+    predictor = None
+    if yolo_model is not None:
+        predictor = YOLOAppleDetector(yolo_model, device=yolo_device)
+    apple_mask = AppleMaskDetector(predictor=predictor).detect(frame.color)
+    if workspace_mask_path is not None and workspace_mask_path.is_file():
         apple_mask = apple_mask & load_mask(workspace_mask_path)
     valid_mask = build_valid_mask(frame.depth, apple_mask)
 
@@ -69,4 +101,22 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Test GraspNet with file or D435i input")
+    parser.add_argument(
+        "--source",
+        choices=("file", "camera"),
+        default="file",
+        help="RGB-D input source",
+    )
+    parser.add_argument(
+        "--yolo-model",
+        default=None,
+        help="Optional YOLOv8-seg checkpoint; omit to use the temporary mask heuristic",
+    )
+    parser.add_argument(
+        "--yolo-device",
+        default=None,
+        help="Optional Ultralytics device, for example 0 or cpu",
+    )
+    arguments = parser.parse_args()
+    main(arguments.source, arguments.yolo_model, arguments.yolo_device)

@@ -29,9 +29,9 @@ class RGBDFrame:
 def load_rgbd(data_dir: PathLike) -> RGBDFrame:
     """Load ``color.png``, ``depth.png`` and ``meta.mat`` from *data_dir*.
 
-    Color is returned as float32 RGB in [0, 1]. Depth values remain in their
-    original units; ``depth_scale`` is metres per raw depth unit, matching the
-    convention used by the RealSense SDK.
+    Color is returned as uint8 RGB. Depth is normalized to uint16 millimetres,
+    matching :class:`RealSenseCamera`; ``depth_scale`` is therefore 0.001
+    metres per depth unit.
     """
 
     data_path = Path(data_dir).expanduser().resolve()
@@ -46,7 +46,7 @@ def load_rgbd(data_dir: PathLike) -> RGBDFrame:
             raise FileNotFoundError("Required RGB-D file not found: {}".format(required_path))
 
     with Image.open(str(color_path)) as image:
-        color = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        color = np.asarray(image.convert("RGB"), dtype=np.uint8)
     with Image.open(str(depth_path)) as image:
         depth = np.asarray(image)
 
@@ -71,7 +71,13 @@ def load_rgbd(data_dir: PathLike) -> RGBDFrame:
     factor_depth_value = float(factor_depth)
     if not np.isfinite(factor_depth_value) or factor_depth_value <= 0:
         raise ValueError("factor_depth must be a positive finite value")
-    depth_scale = 1.0 / factor_depth_value
+    depth_mm = np.rint(
+        depth.astype(np.float32) * np.float32(1000.0 / factor_depth_value)
+    )
+    depth = np.ascontiguousarray(
+        np.clip(depth_mm, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    )
+    depth_scale = 0.001
 
     return RGBDFrame(
         color=np.ascontiguousarray(color),

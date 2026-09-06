@@ -8,7 +8,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class PointCloudData:
-    """Unorganized point cloud in the camera coordinate system."""
+    """Unorganized camera-frame cloud with optional RGB colors in [0, 1]."""
 
     points: np.ndarray
     colors: Optional[np.ndarray] = None
@@ -68,7 +68,10 @@ def create_point_cloud(
         color_array = np.asarray(color)
         if color_array.shape[:2] != depth_array.shape or color_array.ndim != 3:
             raise ValueError("Color must have shape (H, W, C) matching depth")
-        colors = np.ascontiguousarray(color_array[rows, cols], dtype=np.float32)
+        colors = color_array[rows, cols].astype(np.float32)
+        if colors.size and float(colors.max()) > 1.0:
+            colors = colors / 255.0
+        colors = np.ascontiguousarray(np.clip(colors, 0.0, 1.0), dtype=np.float32)
 
     return PointCloudData(points=points, colors=colors)
 
