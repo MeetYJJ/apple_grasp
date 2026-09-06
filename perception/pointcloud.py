@@ -1,40 +1,69 @@
-"""RGB-D projection, geometric filtering, and GraspNet point sampling."""
+"""RGB-D projection, staged point-cloud filtering, and GraspNet sampling."""
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 
-import cv2
 import numpy as np
+
+from .depth_filter import DepthFilter, DepthFilterConfig
 
 if TYPE_CHECKING:
     import open3d
 
 
-@dataclass(frozen=True)
-class PointCloudFilterConfig:
-    """Configurable filters applied before a cloud is sent to GraspNet.
+class InsufficientPointCloudError(ValueError):
+    """Raised when too few real points remain to safely run GraspNet."""
 
-    ``workspace_roi`` uses image coordinates ``(x_min, y_min, x_max, y_max)``
-    with an exclusive maximum bound. Depth limits are expressed in metres.
-    Set ``median_kernel=1``, ``outlier_nb_neighbors=0``, ``voxel_size=0`` or
-    ``normal_radius=0`` to disable the corresponding operation.
+
+@dataclass(frozen=True)
+class PointCloudConfig:
+    """Point-cloud processing switches and tunable parameters.
+
+    Destructive filters are disabled by default. With a valid apple mask this
+    preserves nearly all deprojected depth samples and avoids the previous
+    large point-count collapse. ``workspace_roi`` is
+    ``(x_min, y_min, x_max, y_max)`` in pixels; maximum bounds are exclusive.
+    Depth-filter color deltas are expressed in millimetres because both current
+    RGB-D adapters normalize depth to ``uint16`` millimetres.
     """
 
-    median_kernel: int = 3
     workspace_roi: Optional[Tuple[int, int, int, int]] = None
     min_depth_m: Optional[float] = None
     max_depth_m: Optional[float] = None
+
+    enable_depth_preprocessing: bool = True
+    enable_median_filter: bool = True
+    median_kernel: int = 3
+    enable_spatial_smoothing: bool = True
+    spatial_diameter: int = 5
+    spatial_sigma_color: float = 30.0
+    spatial_sigma_space: float = 3.0
+    enable_hole_filling: bool = True
+    hole_fill_kernel: int = 3
+    hole_fill_min_neighbors: int = 5
+    hole_fill_iterations: int = 1
+    hole_fill_max_depth_delta_mm: float = 80.0
+
+    enable_outlier_filter: bool = False
     outlier_nb_neighbors: int = 20
     outlier_std_ratio: float = 2.0
-    voxel_size: float = 0.002
+    enable_radius_outlier_filter: bool = False
+    radius_outlier_nb_points: int = 8
+    radius_outlier_radius: float = 0.01
+
+    enable_voxel_downsample: bool = False
+    voxel_size: float = 0.001
+    enable_normal_estimation: bool = False
     normal_radius: float = 0.01
     normal_max_nn: int = 30
 
+    min_real_points_warning: int = 5000
+    min_real_points_reject: int = 1000
+
     def __post_init__(self) -> None:
-        if self.median_kernel not in (1, 3, 5):
-            raise ValueError("median_kernel must be one of 1, 3, or 5")
         if self.workspace_roi is not None and len(self.workspace_roi) != 4:
             raise ValueError("workspace_roi must contain x_min, y_min, x_max, y_max")
         if self.min_depth_m is not None and self.min_depth_m < 0:
@@ -47,34 +76,172 @@ class PointCloudFilterConfig:
             and self.min_depth_m >= self.max_depth_m
         ):
             raise ValueError("min_depth_m must be smaller than max_depth_m")
+        if self.median_kernel not in (1, 3, 5):
+            raise ValueError("median_kernel must be one of 1, 3, or 5")
+        if self.spatial_diameter <= 0 or self.spatial_diameter % 2 == 0:
+            raise ValueError("spatial_diameter must be a positive odd integer")
+        if self.spatial_sigma_color <= 0 or self.spatial_sigma_space <= 0:
+            raise ValueError("spatial smoothing sigmas must be positive")
+        if self.hole_fill_kernel < 3 or self.hole_fill_kernel % 2 == 0:
+            raise ValueError("hole_fill_kernel must be an odd integer >= 3")
+        max_hole_neighbors = self.hole_fill_kernel ** 2 - 1
+        if not 1 <= self.hole_fill_min_neighbors <= max_hole_neighbors:
+            raise ValueError("hole_fill_min_neighbors is outside the neighborhood")
+        if self.hole_fill_iterations < 0:
+            raise ValueError("hole_fill_iterations must be non-negative")
+        if self.hole_fill_max_depth_delta_mm <= 0:
+            raise ValueError("hole_fill_max_depth_delta_mm must be positive")
         if self.outlier_nb_neighbors < 0:
             raise ValueError("outlier_nb_neighbors must be non-negative")
+        if self.enable_outlier_filter and self.outlier_nb_neighbors == 0:
+            raise ValueError(
+                "outlier_nb_neighbors must be positive when its filter is enabled"
+            )
         if self.outlier_std_ratio <= 0:
             raise ValueError("outlier_std_ratio must be positive")
+        if self.radius_outlier_nb_points < 0:
+            raise ValueError("radius_outlier_nb_points must be non-negative")
+        if self.radius_outlier_radius < 0:
+            raise ValueError("radius_outlier_radius must be non-negative")
+        if self.enable_radius_outlier_filter and (
+            self.radius_outlier_nb_points == 0 or self.radius_outlier_radius == 0
+        ):
+            raise ValueError(
+                "radius outlier parameters must be positive when enabled"
+            )
         if self.voxel_size < 0:
             raise ValueError("voxel_size must be non-negative")
+        if self.enable_voxel_downsample and self.voxel_size == 0:
+            raise ValueError("voxel_size must be positive when enabled")
         if self.normal_radius < 0:
             raise ValueError("normal_radius must be non-negative")
+        if self.enable_normal_estimation and self.normal_radius == 0:
+            raise ValueError("normal_radius must be positive when enabled")
         if self.normal_max_nn <= 0:
             raise ValueError("normal_max_nn must be positive")
+        if self.min_real_points_reject < 1:
+            raise ValueError("min_real_points_reject must be positive")
+        if self.min_real_points_warning <= self.min_real_points_reject:
+            raise ValueError(
+                "min_real_points_warning must exceed min_real_points_reject"
+            )
+
+    def make_depth_filter(self) -> DepthFilter:
+        """Build one reusable depth processor from this point-cloud config."""
+
+        return DepthFilter(
+            DepthFilterConfig(
+                enable_median_filter=self.enable_median_filter,
+                median_kernel=self.median_kernel,
+                enable_spatial_smoothing=self.enable_spatial_smoothing,
+                spatial_diameter=self.spatial_diameter,
+                spatial_sigma_color=self.spatial_sigma_color,
+                spatial_sigma_space=self.spatial_sigma_space,
+                enable_hole_filling=self.enable_hole_filling,
+                hole_fill_kernel=self.hole_fill_kernel,
+                hole_fill_min_neighbors=self.hole_fill_min_neighbors,
+                hole_fill_iterations=self.hole_fill_iterations,
+                hole_fill_max_depth_delta_mm=(
+                    self.hole_fill_max_depth_delta_mm
+                ),
+            )
+        )
+
+
+# Backward-compatible name used by the previous pipeline revision.
+PointCloudFilterConfig = PointCloudConfig
 
 
 @dataclass
 class PointCloudStats:
-    """Point counts at the important quality-control stages."""
+    """Point counts captured at every stage of cloud construction."""
 
-    raw_mask_pixels: int = 0
+    mask_pixels: int = 0
     valid_depth_pixels: int = 0
-    filtered_points: int = 0
-    graspnet_input_points: int = 0
+    after_roi_pixels: int = 0
+    hole_filled_pixels: int = 0
+    xyz_generated_points: int = 0
+    after_range_filter: int = 0
+    after_outlier_removal: int = 0
+    after_radius_outlier_removal: int = 0
+    after_voxel_downsample: int = 0
+    final_points: int = 0
+    real_points: int = 0
+    sampled_points: int = 0
+    warning_message: Optional[str] = None
 
-    def print(self) -> None:
-        """Print the counters requested by the realtime pipeline."""
+    def reset(self) -> None:
+        for field_name in (
+            "mask_pixels",
+            "valid_depth_pixels",
+            "after_roi_pixels",
+            "hole_filled_pixels",
+            "xyz_generated_points",
+            "after_range_filter",
+            "after_outlier_removal",
+            "after_radius_outlier_removal",
+            "after_voxel_downsample",
+            "final_points",
+            "real_points",
+            "sampled_points",
+        ):
+            setattr(self, field_name, 0)
+        self.warning_message = None
 
-        print("原始mask像素: {}".format(self.raw_mask_pixels))
-        print("有效depth: {}".format(self.valid_depth_pixels))
-        print("滤波后点数: {}".format(self.filtered_points))
-        print("最终输入GraspNet点数: {}".format(self.graspnet_input_points))
+    def as_dict(self) -> Dict[str, int]:
+        return {
+            "mask_pixels": self.mask_pixels,
+            "valid_depth_pixels": self.valid_depth_pixels,
+            "after_roi_pixels": self.after_roi_pixels,
+            "hole_filled_pixels": self.hole_filled_pixels,
+            "xyz_generated_points": self.xyz_generated_points,
+            "after_range_filter": self.after_range_filter,
+            "after_outlier_removal": self.after_outlier_removal,
+            "after_radius_outlier_removal": self.after_radius_outlier_removal,
+            "after_voxel_downsample": self.after_voxel_downsample,
+            "final_points": self.final_points,
+            "real_points": self.real_points,
+            "sampled_points": self.sampled_points,
+        }
+
+    def print(self, frame_index: Optional[int] = None) -> None:
+        heading = (
+            "Point cloud statistics:"
+            if frame_index is None
+            else "Frame {} point cloud statistics:".format(frame_index)
+        )
+        print(heading)
+        print("mask pixels: {}".format(self.mask_pixels))
+        print("valid depth pixels: {}".format(self.valid_depth_pixels))
+        print("after ROI: {}".format(self.after_roi_pixels))
+        print("hole-filled pixels: {}".format(self.hole_filled_pixels))
+        print("xyz generated points: {}".format(self.xyz_generated_points))
+        print("after range filter: {}".format(self.after_range_filter))
+        print("after outlier removal: {}".format(self.after_outlier_removal))
+        print(
+            "after radius outlier removal: {}".format(
+                self.after_radius_outlier_removal
+            )
+        )
+        print("after voxel downsample: {}".format(self.after_voxel_downsample))
+        print("final points: {}".format(self.final_points))
+        print("real_points: {}".format(self.real_points))
+        print("sampled_points: {}".format(self.sampled_points))
+        if self.warning_message:
+            print("WARNING: {}".format(self.warning_message))
+
+    # Compatibility aliases for code written against the previous counters.
+    @property
+    def raw_mask_pixels(self) -> int:
+        return self.mask_pixels
+
+    @property
+    def filtered_points(self) -> int:
+        return self.final_points
+
+    @property
+    def graspnet_input_points(self) -> int:
+        return self.sampled_points
 
 
 @dataclass(frozen=True)
@@ -91,52 +258,53 @@ def create_point_cloud(
     depth_scale: float,
     mask: Optional[np.ndarray] = None,
     color: Optional[np.ndarray] = None,
-    config: Optional[PointCloudFilterConfig] = None,
+    config: Optional[PointCloudConfig] = None,
     stats: Optional[PointCloudStats] = None,
+    depth_filter: Optional[DepthFilter] = None,
 ) -> open3d.geometry.PointCloud:
-    """Create a filtered Open3D point cloud from aligned RGB-D and a mask.
+    """Create a filtered Open3D cloud while preserving existing inputs."""
 
-    The existing positional inputs remain unchanged. ``config`` and ``stats``
-    are optional so offline images and realtime D435i frames share the same
-    interface. Output points are expressed in metres in the camera frame.
-    """
-
-    filter_config = config or PointCloudFilterConfig()
+    cloud_config = config or PointCloudConfig()
     depth_array, intrinsic_array, color_array, object_mask = _validate_inputs(
         depth, intrinsic, depth_scale, mask, color
     )
     height, width = depth_array.shape
-
-    if stats is not None:
-        stats.raw_mask_pixels = int(object_mask.sum())
-        stats.valid_depth_pixels = 0
-        stats.filtered_points = 0
-        stats.graspnet_input_points = 0
+    stage_stats = stats or PointCloudStats()
+    stage_stats.reset()
+    stage_stats.mask_pixels = int(object_mask.sum())
 
     roi_mask = _create_roi_mask(
-        image_shape=(height, width), workspace_roi=filter_config.workspace_roi
+        image_shape=(height, width), workspace_roi=cloud_config.workspace_roi
     )
-    filtered_depth = median_filter_depth(depth_array, filter_config.median_kernel)
-    valid_mask = (
+    measured_valid_before_roi = (
+        object_mask & np.isfinite(depth_array) & (depth_array > 0)
+    )
+    stage_stats.valid_depth_pixels = int(measured_valid_before_roi.sum())
+    measured_valid_mask = measured_valid_before_roi & roi_mask
+    stage_stats.after_roi_pixels = int(measured_valid_mask.sum())
+
+    # Preprocess only the segmented workspace. This prevents median/spatial
+    # neighbors from pulling background or occluder depths across the apple
+    # silhouette while keeping DepthFilter.process(depth) source-independent.
+    masked_depth = depth_array.copy()
+    masked_depth[~(object_mask & roi_mask)] = 0
+    processed_depth = _preprocess_depth(masked_depth, cloud_config, depth_filter)
+    valid_depth_mask = (
         object_mask
         & roi_mask
-        & np.isfinite(filtered_depth)
-        & (filtered_depth > 0)
+        & np.isfinite(processed_depth)
+        & (processed_depth > 0)
     )
+    stage_stats.hole_filled_pixels = int(
+        np.count_nonzero(valid_depth_mask & ~measured_valid_mask)
+    )
+    if not np.any(valid_depth_mask):
+        raise InsufficientPointCloudError(
+            "No valid depth pixels remain after preprocessing, mask, and ROI"
+        )
 
-    depth_metres = filtered_depth.astype(np.float32) * np.float32(depth_scale)
-    if filter_config.min_depth_m is not None:
-        valid_mask &= depth_metres >= np.float32(filter_config.min_depth_m)
-    if filter_config.max_depth_m is not None:
-        valid_mask &= depth_metres <= np.float32(filter_config.max_depth_m)
-
-    valid_depth_pixels = int(valid_mask.sum())
-    if stats is not None:
-        stats.valid_depth_pixels = valid_depth_pixels
-    if valid_depth_pixels == 0:
-        raise ValueError("No valid depth pixels remain after mask and ROI filtering")
-
-    rows, cols = np.nonzero(valid_mask)
+    rows, cols = np.nonzero(valid_depth_mask)
+    depth_metres = processed_depth.astype(np.float32) * np.float32(depth_scale)
     fx = float(intrinsic_array[0, 0])
     fy = float(intrinsic_array[1, 1])
     cx = float(intrinsic_array[0, 2])
@@ -145,84 +313,102 @@ def create_point_cloud(
     x = (cols.astype(np.float32) - cx) * z / fx
     y = (rows.astype(np.float32) - cy) * z / fy
     points = np.ascontiguousarray(np.column_stack((x, y, z)), dtype=np.float64)
+    colors = _extract_colors(color_array, rows, cols)
+    stage_stats.xyz_generated_points = len(points)
+
+    range_mask = np.ones(len(points), dtype=bool)
+    if cloud_config.min_depth_m is not None:
+        range_mask &= points[:, 2] >= cloud_config.min_depth_m
+    if cloud_config.max_depth_m is not None:
+        range_mask &= points[:, 2] <= cloud_config.max_depth_m
+    points = points[range_mask]
+    if colors is not None:
+        colors = colors[range_mask]
+    stage_stats.after_range_filter = len(points)
+    if len(points) == 0:
+        raise InsufficientPointCloudError(
+            "No XYZ points remain inside the configured depth range"
+        )
 
     o3d = _load_open3d()
     cloud = o3d.geometry.PointCloud()
     cloud.points = o3d.utility.Vector3dVector(points)
-    if color_array is not None:
-        colors = color_array[rows, cols].astype(np.float64)
-        if colors.size and float(colors.max()) > 1.0:
-            colors /= 255.0
-        cloud.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
+    if colors is not None:
+        cloud.colors = o3d.utility.Vector3dVector(colors)
 
-    cloud = filter_point_cloud(cloud, filter_config, o3d=o3d)
-    filtered_point_count = len(cloud.points)
-    if filtered_point_count == 0:
-        raise ValueError("All points were removed by point-cloud filtering")
-    if stats is not None:
-        stats.filtered_points = filtered_point_count
+    cloud = filter_point_cloud(cloud, cloud_config, stats=stage_stats, o3d=o3d)
+    stage_stats.final_points = len(cloud.points)
+    stage_stats.real_points = stage_stats.final_points
+    if stage_stats.final_points == 0:
+        raise InsufficientPointCloudError(
+            "All points were removed by point-cloud filtering"
+        )
     return cloud
-
-
-def median_filter_depth(depth: np.ndarray, kernel_size: int = 3) -> np.ndarray:
-    """Apply a fast median filter while preserving the depth array's units."""
-
-    depth_array = np.asarray(depth)
-    if depth_array.ndim != 2:
-        raise ValueError("Depth must have shape (H, W), got {}".format(
-            depth_array.shape
-        ))
-    if kernel_size not in (1, 3, 5):
-        raise ValueError("kernel_size must be one of 1, 3, or 5")
-    if kernel_size == 1:
-        return np.ascontiguousarray(depth_array.copy())
-
-    supported_depth = depth_array
-    if depth_array.dtype not in (np.uint8, np.uint16, np.float32):
-        supported_depth = depth_array.astype(np.float32)
-    return np.ascontiguousarray(
-        cv2.medianBlur(np.ascontiguousarray(supported_depth), kernel_size)
-    )
 
 
 def filter_point_cloud(
     cloud: Any,
-    config: Optional[PointCloudFilterConfig] = None,
+    config: Optional[PointCloudConfig] = None,
     o3d: Optional[Any] = None,
+    stats: Optional[PointCloudStats] = None,
 ) -> open3d.geometry.PointCloud:
-    """Remove statistical outliers, voxelize, and estimate normals."""
+    """Apply optional outlier filters, voxelization, and normal estimation."""
 
-    filter_config = config or PointCloudFilterConfig()
+    cloud_config = config or PointCloudConfig()
     open3d_module = o3d or _load_open3d()
     filtered = cloud
 
-    point_count = len(filtered.points)
     if (
-        filter_config.outlier_nb_neighbors > 0
-        and point_count > filter_config.outlier_nb_neighbors
+        cloud_config.enable_outlier_filter
+        and len(filtered.points) > cloud_config.outlier_nb_neighbors
     ):
         filtered, _ = filtered.remove_statistical_outlier(
-            nb_neighbors=filter_config.outlier_nb_neighbors,
-            std_ratio=filter_config.outlier_std_ratio,
+            nb_neighbors=cloud_config.outlier_nb_neighbors,
+            std_ratio=cloud_config.outlier_std_ratio,
         )
+    if stats is not None:
+        stats.after_outlier_removal = len(filtered.points)
 
-    if filter_config.voxel_size > 0 and len(filtered.points) > 0:
-        filtered = filtered.voxel_down_sample(filter_config.voxel_size)
+    if (
+        cloud_config.enable_radius_outlier_filter
+        and len(filtered.points) >= cloud_config.radius_outlier_nb_points
+    ):
+        filtered, _ = filtered.remove_radius_outlier(
+            nb_points=cloud_config.radius_outlier_nb_points,
+            radius=cloud_config.radius_outlier_radius,
+        )
+    if stats is not None:
+        stats.after_radius_outlier_removal = len(filtered.points)
 
-    if filter_config.normal_radius > 0 and len(filtered.points) >= 3:
+    if cloud_config.enable_voxel_downsample and len(filtered.points) > 0:
+        filtered = filtered.voxel_down_sample(cloud_config.voxel_size)
+    if stats is not None:
+        stats.after_voxel_downsample = len(filtered.points)
+
+    if cloud_config.enable_normal_estimation and len(filtered.points) >= 3:
         filtered.estimate_normals(
             search_param=open3d_module.geometry.KDTreeSearchParamHybrid(
-                radius=filter_config.normal_radius,
-                max_nn=filter_config.normal_max_nn,
+                radius=cloud_config.normal_radius,
+                max_nn=cloud_config.normal_max_nn,
             )
         )
-        # A single RGB-D view observes the surface from the camera origin.
         filtered.orient_normals_towards_camera_location(
             camera_location=np.zeros(3, dtype=np.float64)
         )
         filtered.normalize_normals()
-
     return filtered
+
+
+def median_filter_depth(depth: np.ndarray, kernel_size: int = 3) -> np.ndarray:
+    """Compatibility helper for callers that only require median filtering."""
+
+    config = DepthFilterConfig(
+        enable_median_filter=kernel_size > 1,
+        median_kernel=kernel_size,
+        enable_spatial_smoothing=False,
+        enable_hole_filling=False,
+    )
+    return DepthFilter(config).process(depth)
 
 
 def sample_point_cloud(
@@ -230,25 +416,62 @@ def sample_point_cloud(
     num_points: int = 20000,
     seed: Optional[int] = None,
     stats: Optional[PointCloudStats] = None,
+    min_real_points_warning: int = 5000,
+    min_real_points_reject: int = 1000,
 ) -> PointCloudData:
-    """Sample exactly ``num_points`` using the policy from the official demo."""
+    """Create fixed-size input while warning/rejecting sparse real clouds."""
+
+    if num_points <= 0:
+        raise ValueError("num_points must be positive")
+    if min_real_points_reject < 1:
+        raise ValueError("min_real_points_reject must be positive")
+    if min_real_points_warning <= min_real_points_reject:
+        raise ValueError(
+            "min_real_points_warning must exceed min_real_points_reject"
+        )
 
     points = np.asarray(cloud.points, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("Point cloud must have shape (N, 3), got {}".format(
             points.shape
         ))
-    if len(points) == 0:
-        raise ValueError("Cannot sample an empty point cloud")
-    if num_points <= 0:
-        raise ValueError("num_points must be positive")
+    if not np.all(np.isfinite(points)):
+        raise ValueError("Point cloud contains NaN or infinite coordinates")
+
+    real_point_count = len(points)
+    if stats is not None:
+        stats.real_points = real_point_count
+        stats.sampled_points = 0
+    if real_point_count < min_real_points_reject:
+        message = (
+            "Rejecting frame with {} real points; minimum is {}".format(
+                real_point_count, min_real_points_reject
+            )
+        )
+        if stats is not None:
+            stats.warning_message = message
+        raise InsufficientPointCloudError(message)
+    if real_point_count < min_real_points_warning:
+        message = (
+            "Sparse cloud has {} real points; repeated sampling to {} may "
+            "reduce grasp stability".format(real_point_count, num_points)
+        )
+        if stats is not None:
+            stats.warning_message = message
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
 
     rng = np.random.default_rng(seed)
-    if len(points) >= num_points:
-        indices = rng.choice(len(points), num_points, replace=False)
+    if real_point_count >= num_points:
+        indices = rng.choice(real_point_count, num_points, replace=False)
     else:
-        extra = rng.choice(len(points), num_points - len(points), replace=True)
-        indices = np.concatenate((np.arange(len(points)), extra))
+        # Repeat every real point evenly before adding a non-repeating
+        # remainder. This avoids the highly uneven duplicate distribution of
+        # one large random choice when the cloud is sparse.
+        full_repeats, remainder = divmod(num_points, real_point_count)
+        indices = np.tile(np.arange(real_point_count), full_repeats)
+        if remainder:
+            tail = rng.choice(real_point_count, remainder, replace=False)
+            indices = np.concatenate((indices, tail))
         rng.shuffle(indices)
 
     sampled_colors = None
@@ -261,7 +484,7 @@ def sample_point_cloud(
     )
     if has_colors:
         colors = np.asarray(color_data, dtype=np.float32)
-        if len(colors) != len(points):
+        if len(colors) != real_point_count:
             raise ValueError("Point and color counts must match")
         sampled_colors = np.ascontiguousarray(colors[indices], dtype=np.float32)
 
@@ -270,8 +493,30 @@ def sample_point_cloud(
         colors=sampled_colors,
     )
     if stats is not None:
-        stats.graspnet_input_points = len(result.points)
+        stats.sampled_points = len(result.points)
     return result
+
+
+def _preprocess_depth(
+    depth: np.ndarray,
+    config: PointCloudConfig,
+    depth_filter: Optional[DepthFilter],
+) -> np.ndarray:
+    if not config.enable_depth_preprocessing:
+        return np.ascontiguousarray(depth.copy())
+    processor = depth_filter or config.make_depth_filter()
+    return processor.process(depth)
+
+
+def _extract_colors(
+    color: Optional[np.ndarray], rows: np.ndarray, cols: np.ndarray
+) -> Optional[np.ndarray]:
+    if color is None:
+        return None
+    colors = color[rows, cols].astype(np.float64)
+    if colors.size and float(colors.max()) > 1.0:
+        colors /= 255.0
+    return np.ascontiguousarray(np.clip(colors, 0.0, 1.0))
 
 
 def _validate_inputs(

@@ -1,12 +1,14 @@
 """Realtime D435i + YOLOv8-seg + GraspNet inference pipeline."""
 
 import argparse
+from collections import deque
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
+import torch
 
 from camera.realsense_camera import RealSenseCamera
 from grasp.grasp_selector import GraspSelector
@@ -14,7 +16,8 @@ from grasp.graspnet_runner import GraspNetRunner
 from perception.apple_mask import AppleMaskDetector
 from perception.mask_process import build_valid_mask
 from perception.pointcloud import (
-    PointCloudFilterConfig,
+    InsufficientPointCloudError,
+    PointCloudConfig,
     PointCloudStats,
     create_point_cloud,
     sample_point_cloud,
@@ -84,6 +87,28 @@ def print_best_grasp(best_grasp: Dict[str, object]) -> None:
     print("score: {:.6f}".format(float(best_grasp["score"])))
 
 
+def update_stability(real_point_history, real_points: int) -> Optional[float]:
+    """Track peak-to-peak point-count variation over ten valid frames."""
+
+    real_point_history.append(int(real_points))
+    if len(real_point_history) < real_point_history.maxlen:
+        return None
+    counts = np.asarray(real_point_history, dtype=np.float64)
+    variation = float((counts.max() - counts.min()) / max(counts.mean(), 1.0))
+    print(
+        "10-frame real-point stability: min={} max={} mean={:.1f} "
+        "std={:.1f} variation={:.1f}% ({})".format(
+            int(counts.min()),
+            int(counts.max()),
+            float(counts.mean()),
+            float(counts.std()),
+            variation * 100.0,
+            "PASS" if variation < 0.30 else "WARNING >= 30%",
+        )
+    )
+    return variation
+
+
 def run(args: argparse.Namespace) -> None:
     if args.num_points < 2048:
         raise ValueError("--num-points must be at least 2048")
@@ -96,18 +121,37 @@ def run(args: argparse.Namespace) -> None:
     if args.approach_length <= 0:
         raise ValueError("--approach-length must be positive")
 
-    pointcloud_config = PointCloudFilterConfig(
+    pointcloud_config = PointCloudConfig(
         median_kernel=args.depth_median_kernel,
         workspace_roi=(
             None if args.workspace_roi is None else tuple(args.workspace_roi)
         ),
         min_depth_m=args.min_depth,
         max_depth_m=args.max_depth,
+        enable_depth_preprocessing=not args.disable_depth_preprocessing,
+        enable_median_filter=not args.disable_median_filter,
+        enable_spatial_smoothing=not args.disable_spatial_smoothing,
+        spatial_diameter=args.spatial_diameter,
+        spatial_sigma_color=args.spatial_sigma_color,
+        spatial_sigma_space=args.spatial_sigma_space,
+        enable_hole_filling=not args.disable_hole_filling,
+        hole_fill_kernel=args.hole_fill_kernel,
+        hole_fill_min_neighbors=args.hole_fill_min_neighbors,
+        hole_fill_iterations=args.hole_fill_iterations,
+        hole_fill_max_depth_delta_mm=args.hole_fill_max_depth_delta_mm,
+        enable_outlier_filter=args.enable_outlier_filter,
         outlier_nb_neighbors=args.outlier_neighbors,
         outlier_std_ratio=args.outlier_std_ratio,
+        enable_radius_outlier_filter=args.enable_radius_outlier_filter,
+        radius_outlier_nb_points=args.radius_outlier_nb_points,
+        radius_outlier_radius=args.radius_outlier_radius,
+        enable_voxel_downsample=args.enable_voxel_downsample,
         voxel_size=args.voxel_size,
+        enable_normal_estimation=args.enable_normal_estimation,
         normal_radius=args.normal_radius,
         normal_max_nn=args.normal_max_nn,
+        min_real_points_warning=args.min_real_points_warning,
+        min_real_points_reject=args.min_real_points_reject,
     )
 
     yolo_backend = YOLOAppleDetector(
@@ -133,8 +177,14 @@ def run(args: argparse.Namespace) -> None:
     print("GraspNet checkpoint: {}".format(grasp_runner.checkpoint_path))
     print("GraspNet device: {}".format(grasp_runner.device))
     print("Point-cloud filters: {}".format(pointcloud_config))
+    depth_filter = (
+        pointcloud_config.make_depth_filter()
+        if pointcloud_config.enable_depth_preprocessing
+        else None
+    )
 
     captured_frames = 0
+    real_point_history = deque(maxlen=10)
     try:
         with RealSenseCamera(
             width=args.width,
@@ -189,6 +239,7 @@ def run(args: argparse.Namespace) -> None:
                     continue
 
                 cloud_stats = PointCloudStats()
+                pointcloud_start = time.perf_counter()
                 try:
                     apple_cloud = create_point_cloud(
                         depth=depth_mm,
@@ -198,17 +249,25 @@ def run(args: argparse.Namespace) -> None:
                         color=rgb,
                         config=pointcloud_config,
                         stats=cloud_stats,
+                        depth_filter=depth_filter,
                     )
                     model_cloud = sample_point_cloud(
                         apple_cloud,
                         num_points=args.num_points,
+                        seed=args.sampling_seed,
                         stats=cloud_stats,
+                        min_real_points_warning=(
+                            pointcloud_config.min_real_points_warning
+                        ),
+                        min_real_points_reject=(
+                            pointcloud_config.min_real_points_reject
+                        ),
                     )
-                except ValueError as exc:
+                except InsufficientPointCloudError as exc:
                     print("Frame {}: point cloud rejected: {}".format(
                         captured_frames, exc
                     ))
-                    cloud_stats.print()
+                    cloud_stats.print(frame_index=captured_frames)
                     if not update_views(
                         visualizer,
                         not args.no_visualization,
@@ -221,9 +280,17 @@ def run(args: argparse.Namespace) -> None:
                         break
                     continue
 
-                print("\nFrame {} point cloud quality".format(captured_frames))
-                cloud_stats.print()
+                pointcloud_ms = (time.perf_counter() - pointcloud_start) * 1000.0
+                cloud_stats.print(frame_index=captured_frames)
+                update_stability(real_point_history, cloud_stats.real_points)
+
+                if grasp_runner.device.type == "cuda":
+                    torch.cuda.synchronize(grasp_runner.device)
+                graspnet_start = time.perf_counter()
                 grasp_group = grasp_runner.predict(model_cloud.points)
+                if grasp_runner.device.type == "cuda":
+                    torch.cuda.synchronize(grasp_runner.device)
+                graspnet_ms = (time.perf_counter() - graspnet_start) * 1000.0
                 if len(grasp_group) == 0:
                     print("Frame {}: GraspNet returned no candidates".format(
                         captured_frames
@@ -242,11 +309,18 @@ def run(args: argparse.Namespace) -> None:
 
                 best_grasp = grasp_selector.get_best_grasp(grasp_group)
                 elapsed_ms = (time.perf_counter() - iteration_start) * 1000.0
-                print("\nFrame {}: grasps={} time={:.1f} ms".format(
-                    captured_frames,
-                    len(grasp_group),
-                    elapsed_ms,
-                ))
+                fps = 1000.0 / max(elapsed_ms, 1e-6)
+                print(
+                    "Frame {}: grasps={} pointcloud={:.1f} ms "
+                    "GraspNet={:.1f} ms total={:.1f} ms FPS={:.2f}".format(
+                        captured_frames,
+                        len(grasp_group),
+                        pointcloud_ms,
+                        graspnet_ms,
+                        elapsed_ms,
+                        fps,
+                    )
+                )
                 print_best_grasp(best_grasp)
 
                 status = "score={:.3f}  {:.0f} ms".format(
@@ -319,12 +393,58 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional maximum workspace depth in metres",
     )
+    parser.add_argument("--disable-depth-preprocessing", action="store_true")
+    parser.add_argument("--disable-median-filter", action="store_true")
     parser.add_argument("--depth-median-kernel", type=int, default=3)
+    parser.add_argument("--disable-spatial-smoothing", action="store_true")
+    parser.add_argument("--spatial-diameter", type=int, default=5)
+    parser.add_argument("--spatial-sigma-color", type=float, default=30.0)
+    parser.add_argument("--spatial-sigma-space", type=float, default=3.0)
+    parser.add_argument("--disable-hole-filling", action="store_true")
+    parser.add_argument("--hole-fill-kernel", type=int, default=3)
+    parser.add_argument("--hole-fill-min-neighbors", type=int, default=5)
+    parser.add_argument("--hole-fill-iterations", type=int, default=1)
+    parser.add_argument(
+        "--hole-fill-max-depth-delta-mm",
+        type=float,
+        default=80.0,
+        help="Maximum local depth span for conservative hole filling",
+    )
+    parser.add_argument(
+        "--enable-outlier-filter",
+        action="store_true",
+        help="Enable statistical outlier removal (disabled by default)",
+    )
     parser.add_argument("--outlier-neighbors", type=int, default=20)
     parser.add_argument("--outlier-std-ratio", type=float, default=2.0)
-    parser.add_argument("--voxel-size", type=float, default=0.002)
+    parser.add_argument(
+        "--enable-radius-outlier-filter",
+        action="store_true",
+        help="Enable radius outlier removal (disabled by default)",
+    )
+    parser.add_argument("--radius-outlier-nb-points", type=int, default=8)
+    parser.add_argument("--radius-outlier-radius", type=float, default=0.01)
+    parser.add_argument(
+        "--enable-voxel-downsample",
+        action="store_true",
+        help="Enable voxel downsampling (disabled by default)",
+    )
+    parser.add_argument("--voxel-size", type=float, default=0.001)
+    parser.add_argument(
+        "--enable-normal-estimation",
+        action="store_true",
+        help="Estimate normals in the realtime cloud (disabled by default)",
+    )
     parser.add_argument("--normal-radius", type=float, default=0.01)
     parser.add_argument("--normal-max-nn", type=int, default=30)
+    parser.add_argument("--min-real-points-warning", type=int, default=5000)
+    parser.add_argument("--min-real-points-reject", type=int, default=1000)
+    parser.add_argument(
+        "--sampling-seed",
+        type=int,
+        default=0,
+        help="Fixed sampling seed for stable realtime input",
+    )
     parser.add_argument(
         "--coordinate-size",
         type=float,

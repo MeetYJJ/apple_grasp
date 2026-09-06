@@ -1,11 +1,14 @@
 """RGB-D perception utilities for the apple grasp pipeline."""
 
 from .apple_mask import AppleMaskDetector
+from .depth_filter import DepthFilter, DepthFilterConfig
 from .mask_process import build_valid_mask, load_mask
 from .pointcloud import (
     PointCloudData,
+    PointCloudConfig,
     PointCloudFilterConfig,
     PointCloudStats,
+    InsufficientPointCloudError,
     create_point_cloud,
     filter_point_cloud,
     median_filter_depth,
@@ -18,8 +21,12 @@ from .yolo_apple_detector import DEFAULT_YOLO_MODEL, YOLOAppleDetector
 __all__ = [
     "RGBDFrame",
     "PointCloudData",
+    "PointCloudConfig",
     "PointCloudFilterConfig",
     "PointCloudStats",
+    "InsufficientPointCloudError",
+    "DepthFilter",
+    "DepthFilterConfig",
     "AppleMaskDetector",
     "YOLOAppleDetector",
     "DEFAULT_YOLO_MODEL",
