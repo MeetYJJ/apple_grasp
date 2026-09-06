@@ -26,7 +26,7 @@ the current stage.
 
 - `perception/rgbd_loader.py`: reads offline RGB-D data and camera intrinsics.
 - `perception/apple_mask.py`: exposes `AppleMaskDetector.detect(rgb) -> mask`.
-- `perception/realsense_camera.py`: captures aligned D435i RGB-D frames.
+- `camera/realsense_camera.py`: captures aligned D435i RGB-D frames.
 - `perception/mask_process.py`: combines segmentation and valid-depth masks.
 - `perception/pointcloud.py`: projects masked depth and samples model input.
 - `grasp/graspnet_runner.py`: loads GraspNet and returns a `GraspGroup`.
@@ -96,15 +96,24 @@ Install the optional inference dependency:
 pip install ultralytics
 ```
 
-Provide an existing YOLOv8-seg checkpoint containing an `apple` class, then run:
+For a public-model smoke test, run:
 
 ```bash
-python test_yolo_apple.py --model-path /path/to/yolov8n-seg.pt
+python test_yolo_apple.py
 ```
 
-The official GraspNet example image contains no apple, so a compatible COCO
-checkpoint may correctly produce an empty mask. The test still verifies model
-loading, output shape/type, and writes `output/apple_mask_yolo.png`.
+This loads the public COCO-pretrained `yolov8n-seg.pt`; on first use,
+Ultralytics downloads the weights automatically. COCO class `apple` (class ID
+47) is selected, all detected apple instances are merged, and the boolean
+result is written to `output/apple_mask_yolo.png`. The official GraspNet
+example image contains no apple, so an empty output is a valid result for that
+image; use the D435i realtime command below to test with an apple in view.
+
+A local or future custom checkpoint is still supported:
+
+```bash
+python test_yolo_apple.py --model-path /path/to/apple-seg.pt
+```
 
 Application integration uses the same segmentation interface as before:
 
@@ -119,7 +128,7 @@ apple_mask = detector.detect(rgb)
 
 ## Intel RealSense D435i
 
-`perception/realsense_camera.py` supplies depth aligned to the color image in
+`camera/realsense_camera.py` supplies depth aligned to the color image in
 the same format as the offline loader:
 
 - RGB: NumPy `uint8`, `(H, W, 3)`, RGB channel order.
@@ -158,3 +167,47 @@ python test_graspnet_runner.py --source camera \
 
 RealSense acquisition stops before grasp inference begins. Mechanical-arm
 control and camera-to-robot calibration remain outside the current stage.
+
+## Realtime grasp prediction
+
+`test_realtime_grasp.py` keeps the camera and both neural networks initialized,
+then repeatedly runs the complete perception and grasp pipeline:
+
+```text
+D435i aligned RGB-D
+  ↓
+YOLOv8-seg apple mask
+  ↓
+Masked metric apple point cloud
+  ↓
+GraspNet candidates
+  ↓
+Highest-scoring grasp in the camera frame
+```
+
+Run the complete chain with the public COCO model:
+
+```bash
+python test_realtime_grasp.py --yolo-device 0
+```
+
+`--yolo-model` defaults to `yolov8n-seg.pt`. It may also be set to a local
+custom segmentation checkpoint. When no apple is detected, the frame is
+skipped before point-cloud creation and GraspNet inference.
+
+The OpenCV window shows RGB with the apple mask highlighted in green. The
+Open3D window shows the apple point cloud and the best-grasp coordinate frame:
+x is red, y is green, and z is blue. The terminal prints position, the `3x3`
+rotation matrix, score, candidate count, and per-iteration elapsed time.
+
+Press `q`, `Esc`, or `Ctrl+C` to stop. For one headless inference iteration:
+
+```bash
+python test_realtime_grasp.py \
+  --yolo-device 0 \
+  --max-frames 1 \
+  --no-visualization
+```
+
+The latest best grasp is also saved to `output/best_grasp.npy`. All poses remain
+in the D435i color-camera frame; no mechanical-arm commands are generated.

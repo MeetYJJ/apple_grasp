@@ -5,7 +5,7 @@ import argparse
 import cv2
 import numpy as np
 
-from perception.realsense_camera import RealSenseCamera
+from camera.realsense_camera import RealSenseCamera
 
 
 def main(width: int = 640, height: int = 480, fps: int = 30) -> None:

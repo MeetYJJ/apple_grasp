@@ -8,6 +8,7 @@ from PIL import Image
 
 
 PathLike = Union[str, Path]
+DEFAULT_YOLO_MODEL = "yolov8n-seg.pt"
 
 
 class YOLOAppleDetector:
@@ -20,19 +21,29 @@ class YOLOAppleDetector:
 
     def __init__(
         self,
-        model_path: PathLike,
+        model_path: PathLike = DEFAULT_YOLO_MODEL,
         confidence: float = 0.25,
         iou_threshold: float = 0.7,
         device: Optional[str] = None,
         class_name: str = "apple",
     ) -> None:
-        """Load a YOLOv8-seg model from ``model_path``."""
+        """Load a YOLOv8-seg model from a local path or Ultralytics model name.
 
-        self.model_path = Path(model_path).expanduser().resolve()
-        if not self.model_path.is_file():
-            raise FileNotFoundError("YOLO segmentation model not found: {}".format(
-                self.model_path
-            ))
+        Passing ``yolov8n-seg.pt`` uses the public COCO-pretrained checkpoint.
+        Ultralytics downloads it automatically on first use when it is not
+        already cached locally.
+        """
+
+        model_source = str(model_path).strip()
+        if not model_source:
+            raise ValueError("model_path must not be empty")
+
+        # Keep local checkpoints absolute, but pass public model names through
+        # unchanged so Ultralytics can resolve/download official weights.
+        local_model = Path(model_source).expanduser()
+        self.model_path = (
+            str(local_model.resolve()) if local_model.is_file() else model_source
+        )
         if not 0.0 <= confidence <= 1.0:
             raise ValueError("confidence must be in [0, 1]")
         if not 0.0 <= iou_threshold <= 1.0:
@@ -52,7 +63,7 @@ class YOLOAppleDetector:
         self.iou_threshold = float(iou_threshold)
         self.device = device
         self.class_name = class_name.strip().lower()
-        self.model = YOLO(str(self.model_path))
+        self.model = YOLO(self.model_path)
 
         model_task = getattr(self.model, "task", None)
         if model_task is not None and model_task != "segment":

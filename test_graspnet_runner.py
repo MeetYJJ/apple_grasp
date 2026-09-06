@@ -6,12 +6,12 @@ from typing import Optional, Tuple
 
 import torch
 
+from camera.realsense_camera import RealSenseCamera
 from grasp.grasp_selector import GraspSelector
 from grasp.graspnet_runner import GraspNetRunner
 from perception.apple_mask import AppleMaskDetector
 from perception.mask_process import build_valid_mask, load_mask
 from perception.pointcloud import create_point_cloud, sample_point_cloud
-from perception.realsense_camera import RealSenseCamera
 from perception.rgbd_loader import RGBDFrame, load_rgbd
 from perception.yolo_apple_detector import YOLOAppleDetector
 

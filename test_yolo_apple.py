@@ -7,7 +7,7 @@ import numpy as np
 from PIL import Image
 
 from perception.apple_mask import AppleMaskDetector
-from perception.yolo_apple_detector import YOLOAppleDetector
+from perception.yolo_apple_detector import DEFAULT_YOLO_MODEL, YOLOAppleDetector
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,6 +34,7 @@ def main(model_path: str, device: str = None) -> None:
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(apple_mask.astype(np.uint8) * 255, mode="L").save(str(OUTPUT_PATH))
     print("YOLO model loaded: {}".format(yolo_predictor.model_path))
+    print("Apple class id(s): {}".format(yolo_predictor.apple_class_ids))
     print("Apple mask saved: {}".format(OUTPUT_PATH))
     print("Mask shape: {}; dtype: {}; pixels: {}".format(
         apple_mask.shape, apple_mask.dtype, int(apple_mask.sum())
@@ -44,8 +45,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Test YOLOv8-seg apple mask inference")
     parser.add_argument(
         "--model-path",
-        required=True,
-        help="Path to a YOLOv8 segmentation .pt checkpoint containing an apple class",
+        default=DEFAULT_YOLO_MODEL,
+        help=(
+            "Local segmentation checkpoint or official Ultralytics model name "
+            "(default: yolov8n-seg.pt)"
+        ),
     )
     parser.add_argument(
         "--device",
