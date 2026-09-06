@@ -14,6 +14,12 @@ from .pointcloud import (
     median_filter_depth,
     sample_point_cloud,
 )
+from .pointcloud_temporal_filter import (
+    MaskTemporalStats,
+    PointCloudTemporalStats,
+    TemporalPointCloudConfig,
+    TemporalPointCloudFilter,
+)
 from camera.realsense_camera import RealSenseCamera
 from .rgbd_loader import RGBDFrame, load_rgbd
 from .yolo_apple_detector import DEFAULT_YOLO_MODEL, YOLOAppleDetector
@@ -38,4 +44,8 @@ __all__ = [
     "median_filter_depth",
     "filter_point_cloud",
     "sample_point_cloud",
+    "TemporalPointCloudFilter",
+    "TemporalPointCloudConfig",
+    "MaskTemporalStats",
+    "PointCloudTemporalStats",
 ]
