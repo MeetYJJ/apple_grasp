@@ -31,6 +31,8 @@ the current stage.
 - `perception/pointcloud.py`: projects masked depth and samples model input.
 - `grasp/graspnet_runner.py`: loads GraspNet and returns a `GraspGroup`.
 - `grasp/grasp_selector.py`: selects and saves the highest-scoring grasp.
+- `visualization/grasp_visualizer.py`: updates the Open3D cloud, camera frame,
+  grasp frame, and grasp-approach arrow.
 
 `AppleMaskDetector` currently uses a simple red-region heuristic so that the
 pipeline can be exercised without a model. It is not a trained apple detector
@@ -196,9 +198,24 @@ custom segmentation checkpoint. When no apple is detected, the frame is
 skipped before point-cloud creation and GraspNet inference.
 
 The OpenCV window shows RGB with the apple mask highlighted in green. The
-Open3D window shows the apple point cloud and the best-grasp coordinate frame:
-x is red, y is green, and z is blue. The terminal prints position, the `3x3`
-rotation matrix, score, candidate count, and per-iteration elapsed time.
+Open3D window is updated in place and shows:
+
+- the RGB-colored apple point cloud;
+- the camera coordinate frame at the origin;
+- the best-grasp coordinate frame transformed by `T_camera_grasp`;
+- a yellow approach arrow pointing along GraspNet grasp +X (`R[:, 0]`) toward
+  the grasp position.
+
+The grasp transform is assembled directly from the selected camera-frame pose:
+
+```text
+T_camera_grasp = [ R  t ]
+                 [ 0  1 ]
+```
+
+Coordinate-frame axes use the Open3D convention: x is red, y is green, and z
+is blue. The terminal prints position, the `3x3` rotation matrix, score,
+candidate count, and per-iteration elapsed time.
 
 Press `q`, `Esc`, or `Ctrl+C` to stop. For one headless inference iteration:
 
@@ -211,3 +228,13 @@ python test_realtime_grasp.py \
 
 The latest best grasp is also saved to `output/best_grasp.npy`. All poses remain
 in the D435i color-camera frame; no mechanical-arm commands are generated.
+
+Visualization sizes can be adjusted without changing inference:
+
+```bash
+python test_realtime_grasp.py \
+  --yolo-device 0 \
+  --camera-coordinate-size 0.10 \
+  --coordinate-size 0.06 \
+  --approach-length 0.10
+```

@@ -15,6 +15,7 @@ from perception.apple_mask import AppleMaskDetector
 from perception.mask_process import build_valid_mask
 from perception.pointcloud import PointCloudData, create_point_cloud, sample_point_cloud
 from perception.yolo_apple_detector import DEFAULT_YOLO_MODEL, YOLOAppleDetector
+from visualization.grasp_visualizer import GraspVisualizer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -23,74 +24,19 @@ DEFAULT_BASELINE_DIR = WORKSPACE_ROOT / "graspnet-baseline"
 DEFAULT_CHECKPOINT_PATH = DEFAULT_BASELINE_DIR / "checkpoint-rs.tar"
 
 
-def load_open3d():
-    try:
-        import open3d as o3d
-    except ImportError as exc:
-        raise ImportError(
-            "Open3D is required for realtime 3D visualization. "
-            "Install open3d or run with --no-visualization."
-        ) from exc
-    return o3d
+def update_views(
+    visualizer: GraspVisualizer,
+    enabled: bool,
+    rgb: np.ndarray,
+    apple_mask: np.ndarray,
+    cloud: Optional[PointCloudData],
+    best_grasp: Optional[Dict[str, object]],
+    status: str,
+) -> bool:
+    """Update the RGB overlay and modular Open3D grasp scene."""
 
-
-def create_grasp_coordinate_frame(
-    best_grasp: Dict[str, object], size: float
-):
-    """Create an Open3D coordinate frame for a camera-frame grasp pose."""
-
-    o3d = load_open3d()
-    position = np.asarray(best_grasp["position"], dtype=np.float64)
-    rotation = np.asarray(best_grasp["rotation"], dtype=np.float64)
-    if position.shape != (3,) or rotation.shape != (3, 3):
-        raise ValueError("Best grasp must contain position (3,) and rotation (3, 3)")
-
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation
-    transform[:3, 3] = position
-    coordinate_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=size)
-    coordinate_frame.transform(transform)
-    return coordinate_frame
-
-
-class RealtimeVisualizer:
-    """Keep OpenCV RGB and Open3D point-cloud windows responsive."""
-
-    def __init__(self, enabled: bool = True, coordinate_size: float = 0.06) -> None:
-        self.enabled = enabled
-        self.coordinate_size = coordinate_size
-        self._point_cloud = None
-        self._grasp_frame = None
-        self._visualizer = None
-        self._o3d = None
-
-        if self.enabled:
-            self._o3d = load_open3d()
-            self._visualizer = self._o3d.visualization.Visualizer()
-            window_created = self._visualizer.create_window(
-                window_name="Apple point cloud and best grasp",
-                width=960,
-                height=720,
-            )
-            if not window_created:
-                raise RuntimeError("Failed to create the Open3D visualization window")
-            render_option = self._visualizer.get_render_option()
-            render_option.point_size = 2.0
-            render_option.background_color = np.asarray([0.03, 0.03, 0.03])
-
-    def update(
-        self,
-        rgb: np.ndarray,
-        apple_mask: np.ndarray,
-        cloud: Optional[PointCloudData],
-        best_grasp: Optional[Dict[str, object]],
-        status: str,
-    ) -> bool:
-        """Update both windows and return False when the user requests exit."""
-
-        if not self.enabled:
-            return True
-
+    rgb_window_alive = True
+    if enabled:
         display_rgb = np.asarray(rgb, dtype=np.uint8).copy()
         if apple_mask.shape == display_rgb.shape[:2] and np.any(apple_mask):
             green = np.asarray([0, 255, 0], dtype=np.float32)
@@ -110,59 +56,13 @@ class RealtimeVisualizer:
             cv2.LINE_AA,
         )
         cv2.imshow("Realtime RGB and apple mask", display_bgr)
-
-        self._replace_geometry(cloud, best_grasp)
-        window_alive = self._visualizer.poll_events()
-        self._visualizer.update_renderer()
         key = cv2.waitKey(1) & 0xFF
-        return bool(window_alive) and key not in (ord("q"), 27)
+        rgb_window_alive = key not in (ord("q"), 27)
 
-    def _replace_geometry(
-        self,
-        cloud: Optional[PointCloudData],
-        best_grasp: Optional[Dict[str, object]],
-    ) -> None:
-        if self._grasp_frame is not None:
-            self._visualizer.remove_geometry(
-                self._grasp_frame, reset_bounding_box=False
-            )
-            self._grasp_frame = None
-
-        if cloud is None:
-            if self._point_cloud is not None:
-                self._visualizer.remove_geometry(
-                    self._point_cloud, reset_bounding_box=False
-                )
-                self._point_cloud = None
-            return
-
-        first_cloud = self._point_cloud is None
-        if first_cloud:
-            self._point_cloud = self._o3d.geometry.PointCloud()
-        self._point_cloud.points = self._o3d.utility.Vector3dVector(cloud.points)
-        if cloud.colors is not None:
-            self._point_cloud.colors = self._o3d.utility.Vector3dVector(cloud.colors)
-        else:
-            self._point_cloud.colors = self._o3d.utility.Vector3dVector()
-        if first_cloud:
-            self._visualizer.add_geometry(self._point_cloud, reset_bounding_box=True)
-        else:
-            self._visualizer.update_geometry(self._point_cloud)
-
-        if best_grasp is not None:
-            self._grasp_frame = create_grasp_coordinate_frame(
-                best_grasp, self.coordinate_size
-            )
-            self._visualizer.add_geometry(
-                self._grasp_frame, reset_bounding_box=False
-            )
-
-    def close(self) -> None:
-        if not self.enabled:
-            return
-        cv2.destroyAllWindows()
-        if self._visualizer is not None:
-            self._visualizer.destroy_window()
+    position = None if best_grasp is None else best_grasp["position"]
+    rotation = None if best_grasp is None else best_grasp["rotation"]
+    scene_window_alive = visualizer.update(cloud, position, rotation)
+    return rgb_window_alive and scene_window_alive
 
 
 def print_best_grasp(best_grasp: Dict[str, object]) -> None:
@@ -186,6 +86,10 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--max-frames must be non-negative")
     if args.coordinate_size <= 0:
         raise ValueError("--coordinate-size must be positive")
+    if args.camera_coordinate_size <= 0:
+        raise ValueError("--camera-coordinate-size must be positive")
+    if args.approach_length <= 0:
+        raise ValueError("--approach-length must be positive")
 
     yolo_backend = YOLOAppleDetector(
         model_path=args.yolo_model,
@@ -198,9 +102,11 @@ def run(args: argparse.Namespace) -> None:
         baseline_dir=args.baseline_dir,
     )
     grasp_selector = GraspSelector()
-    visualizer = RealtimeVisualizer(
+    visualizer = GraspVisualizer(
         enabled=not args.no_visualization,
-        coordinate_size=args.coordinate_size,
+        camera_frame_size=args.camera_coordinate_size,
+        grasp_frame_size=args.coordinate_size,
+        approach_length=args.approach_length,
     )
 
     print("YOLO model: {}".format(yolo_backend.model_path))
@@ -232,8 +138,14 @@ def run(args: argparse.Namespace) -> None:
                 mask_pixels = int(apple_mask.sum())
                 if mask_pixels == 0:
                     print("Frame {}: no apple detected".format(captured_frames))
-                    if not visualizer.update(
-                        rgb, apple_mask, None, None, "No apple detected"
+                    if not update_views(
+                        visualizer,
+                        not args.no_visualization,
+                        rgb,
+                        apple_mask,
+                        None,
+                        None,
+                        "No apple detected",
                     ):
                         break
                     continue
@@ -244,8 +156,14 @@ def run(args: argparse.Namespace) -> None:
                     print("Frame {}: apple mask has no valid depth".format(
                         captured_frames
                     ))
-                    if not visualizer.update(
-                        rgb, apple_mask, None, None, "Apple has no valid depth"
+                    if not update_views(
+                        visualizer,
+                        not args.no_visualization,
+                        rgb,
+                        apple_mask,
+                        None,
+                        None,
+                        "Apple has no valid depth",
                     ):
                         break
                     continue
@@ -265,8 +183,14 @@ def run(args: argparse.Namespace) -> None:
                     print("Frame {}: GraspNet returned no candidates".format(
                         captured_frames
                     ))
-                    if not visualizer.update(
-                        rgb, apple_mask, apple_cloud, None, "No grasp candidates"
+                    if not update_views(
+                        visualizer,
+                        not args.no_visualization,
+                        rgb,
+                        apple_mask,
+                        apple_cloud,
+                        None,
+                        "No grasp candidates",
                     ):
                         break
                     continue
@@ -286,13 +210,21 @@ def run(args: argparse.Namespace) -> None:
                 status = "score={:.3f}  {:.0f} ms".format(
                     float(best_grasp["score"]), elapsed_ms
                 )
-                if not visualizer.update(
-                    rgb, apple_mask, apple_cloud, best_grasp, status
+                if not update_views(
+                    visualizer,
+                    not args.no_visualization,
+                    rgb,
+                    apple_mask,
+                    apple_cloud,
+                    best_grasp,
+                    status,
                 ):
                     break
     except KeyboardInterrupt:
         print("Realtime grasp pipeline stopped by user")
     finally:
+        if not args.no_visualization:
+            cv2.destroyAllWindows()
         visualizer.close()
 
 
@@ -330,6 +262,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.06,
         help="Best-grasp coordinate-frame size in metres",
+    )
+    parser.add_argument(
+        "--camera-coordinate-size",
+        type=float,
+        default=0.10,
+        help="Camera coordinate-frame size in metres",
+    )
+    parser.add_argument(
+        "--approach-length",
+        type=float,
+        default=0.10,
+        help="Displayed grasp approach-arrow length in metres",
     )
     parser.add_argument(
         "--max-frames",

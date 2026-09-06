@@ -2,3 +2,4 @@ ultralytics>=8.0
 pyrealsense2==2.55.1.6486; python_version < "3.9"
 pyrealsense2; python_version >= "3.9"
 opencv-python
+open3d
