@@ -6,6 +6,7 @@ import torch
 
 from grasp.grasp_selector import GraspSelector
 from grasp.graspnet_runner import GraspNetRunner
+from perception.apple_mask import AppleMaskDetector
 from perception.mask_process import build_valid_mask, load_mask
 from perception.pointcloud import create_point_cloud, sample_point_cloud
 from perception.rgbd_loader import load_rgbd
@@ -22,9 +23,11 @@ OUTPUT_PATH = PROJECT_ROOT / "output" / "best_grasp.npy"
 def main() -> None:
     frame = load_rgbd(DATA_DIR)
 
+    apple_mask = AppleMaskDetector().detect(frame.color)
     workspace_mask_path = DATA_DIR / "workspace_mask.png"
-    object_mask = load_mask(workspace_mask_path) if workspace_mask_path.is_file() else None
-    valid_mask = build_valid_mask(frame.depth, object_mask)
+    if workspace_mask_path.is_file():
+        apple_mask = apple_mask & load_mask(workspace_mask_path)
+    valid_mask = build_valid_mask(frame.depth, apple_mask)
 
     full_cloud = create_point_cloud(
         depth=frame.depth,
