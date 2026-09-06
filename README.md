@@ -28,7 +28,8 @@ the current stage.
 - `perception/apple_mask.py`: exposes `AppleMaskDetector.detect(rgb) -> mask`.
 - `camera/realsense_camera.py`: captures aligned D435i RGB-D frames.
 - `perception/mask_process.py`: combines segmentation and valid-depth masks.
-- `perception/pointcloud.py`: projects masked depth and samples model input.
+- `perception/pointcloud.py`: filters depth, creates an Open3D point cloud,
+  removes geometric noise, estimates normals, and samples model input.
 - `grasp/graspnet_runner.py`: loads GraspNet and returns a `GraspGroup`.
 - `grasp/grasp_selector.py`: selects and saves the highest-scoring grasp.
 - `visualization/grasp_visualizer.py`: updates the Open3D cloud, camera frame,
@@ -69,6 +70,60 @@ python test_graspnet_runner.py
 ```
 
 The selected grasp is written to `output/best_grasp.npy`.
+
+## Point-cloud quality filtering
+
+`perception/pointcloud.py` keeps the existing aligned RGB/depth/mask inputs but
+now returns a filtered `open3d.geometry.PointCloud`. The default processing
+order is:
+
+```text
+3x3 depth median filter
+  ↓
+apple mask + optional pixel ROI + optional depth range
+  ↓
+camera-frame XYZ projection
+  ↓
+statistical outlier removal (20 neighbours, std ratio 2.0)
+  ↓
+2 mm voxel downsampling
+  ↓
+normal estimation (1 cm radius, 30 neighbours)
+```
+
+Normals are oriented toward the camera for consistent display. GraspNet still
+receives only the filtered XYZ samples, so its network and input contract are
+unchanged.
+
+Compare the original mask-projected cloud, filtered cloud, and normals using
+the offline example:
+
+```bash
+python test_pointcloud_quality.py --source file
+```
+
+The three Open3D views are shown sequentially. For a D435i apple frame:
+
+```bash
+python test_pointcloud_quality.py \
+  --source camera \
+  --yolo-device 0 \
+  --workspace-roi 80 40 560 440 \
+  --min-depth 0.20 \
+  --max-depth 1.50
+```
+
+ROI coordinates are `(x_min, y_min, x_max, y_max)` pixels with exclusive
+maximum bounds. Depth limits should match the physical grasp workspace; they
+are intentionally disabled unless supplied. Both the quality test and realtime
+pipeline print:
+
+```text
+原始mask像素: ...
+有效depth: ...
+滤波后点数: ...
+最终输入GraspNet点数: ...
+```
 
 ## YOLOv8-seg + GraspNet pipeline
 
@@ -191,6 +246,16 @@ Run the complete chain with the public COCO model:
 
 ```bash
 python test_realtime_grasp.py --yolo-device 0
+```
+
+Apply a physical workspace crop to reject distant masks and irrelevant depth:
+
+```bash
+python test_realtime_grasp.py \
+  --yolo-device 0 \
+  --workspace-roi 80 40 560 440 \
+  --min-depth 0.20 \
+  --max-depth 1.50
 ```
 
 `--yolo-model` defaults to `yolov8n-seg.pt`. It may also be set to a local

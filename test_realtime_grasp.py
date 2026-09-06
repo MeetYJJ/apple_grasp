@@ -3,7 +3,7 @@
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
@@ -13,7 +13,12 @@ from grasp.grasp_selector import GraspSelector
 from grasp.graspnet_runner import GraspNetRunner
 from perception.apple_mask import AppleMaskDetector
 from perception.mask_process import build_valid_mask
-from perception.pointcloud import PointCloudData, create_point_cloud, sample_point_cloud
+from perception.pointcloud import (
+    PointCloudFilterConfig,
+    PointCloudStats,
+    create_point_cloud,
+    sample_point_cloud,
+)
 from perception.yolo_apple_detector import DEFAULT_YOLO_MODEL, YOLOAppleDetector
 from visualization.grasp_visualizer import GraspVisualizer
 
@@ -29,7 +34,7 @@ def update_views(
     enabled: bool,
     rgb: np.ndarray,
     apple_mask: np.ndarray,
-    cloud: Optional[PointCloudData],
+    cloud: Optional[Any],
     best_grasp: Optional[Dict[str, object]],
     status: str,
 ) -> bool:
@@ -91,6 +96,20 @@ def run(args: argparse.Namespace) -> None:
     if args.approach_length <= 0:
         raise ValueError("--approach-length must be positive")
 
+    pointcloud_config = PointCloudFilterConfig(
+        median_kernel=args.depth_median_kernel,
+        workspace_roi=(
+            None if args.workspace_roi is None else tuple(args.workspace_roi)
+        ),
+        min_depth_m=args.min_depth,
+        max_depth_m=args.max_depth,
+        outlier_nb_neighbors=args.outlier_neighbors,
+        outlier_std_ratio=args.outlier_std_ratio,
+        voxel_size=args.voxel_size,
+        normal_radius=args.normal_radius,
+        normal_max_nn=args.normal_max_nn,
+    )
+
     yolo_backend = YOLOAppleDetector(
         model_path=args.yolo_model,
         confidence=args.confidence,
@@ -113,6 +132,7 @@ def run(args: argparse.Namespace) -> None:
     print("YOLO apple class id(s): {}".format(yolo_backend.apple_class_ids))
     print("GraspNet checkpoint: {}".format(grasp_runner.checkpoint_path))
     print("GraspNet device: {}".format(grasp_runner.device))
+    print("Point-cloud filters: {}".format(pointcloud_config))
 
     captured_frames = 0
     try:
@@ -168,16 +188,41 @@ def run(args: argparse.Namespace) -> None:
                         break
                     continue
 
-                apple_cloud = create_point_cloud(
-                    depth=depth_mm,
-                    intrinsic=intrinsic,
-                    depth_scale=camera.depth_scale,
-                    mask=valid_mask,
-                    color=rgb,
-                )
-                model_cloud = sample_point_cloud(
-                    apple_cloud, num_points=args.num_points
-                )
+                cloud_stats = PointCloudStats()
+                try:
+                    apple_cloud = create_point_cloud(
+                        depth=depth_mm,
+                        intrinsic=intrinsic,
+                        depth_scale=camera.depth_scale,
+                        mask=apple_mask,
+                        color=rgb,
+                        config=pointcloud_config,
+                        stats=cloud_stats,
+                    )
+                    model_cloud = sample_point_cloud(
+                        apple_cloud,
+                        num_points=args.num_points,
+                        stats=cloud_stats,
+                    )
+                except ValueError as exc:
+                    print("Frame {}: point cloud rejected: {}".format(
+                        captured_frames, exc
+                    ))
+                    cloud_stats.print()
+                    if not update_views(
+                        visualizer,
+                        not args.no_visualization,
+                        rgb,
+                        apple_mask,
+                        None,
+                        None,
+                        "Point cloud rejected",
+                    ):
+                        break
+                    continue
+
+                print("\nFrame {} point cloud quality".format(captured_frames))
+                cloud_stats.print()
                 grasp_group = grasp_runner.predict(model_cloud.points)
                 if len(grasp_group) == 0:
                     print("Frame {}: GraspNet returned no candidates".format(
@@ -197,11 +242,8 @@ def run(args: argparse.Namespace) -> None:
 
                 best_grasp = grasp_selector.get_best_grasp(grasp_group)
                 elapsed_ms = (time.perf_counter() - iteration_start) * 1000.0
-                print("\nFrame {}: mask={} depth={} points={} grasps={} time={:.1f} ms".format(
+                print("\nFrame {}: grasps={} time={:.1f} ms".format(
                     captured_frames,
-                    mask_pixels,
-                    valid_depth_pixels,
-                    len(apple_cloud.points),
                     len(grasp_group),
                     elapsed_ms,
                 ))
@@ -257,6 +299,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--serial", default=None, help="Optional RealSense serial number")
     parser.add_argument("--num-points", type=int, default=20000)
+    parser.add_argument(
+        "--workspace-roi",
+        type=int,
+        nargs=4,
+        metavar=("X_MIN", "Y_MIN", "X_MAX", "Y_MAX"),
+        default=None,
+        help="Optional pixel ROI with exclusive maximum bounds",
+    )
+    parser.add_argument(
+        "--min-depth",
+        type=float,
+        default=None,
+        help="Optional minimum workspace depth in metres",
+    )
+    parser.add_argument(
+        "--max-depth",
+        type=float,
+        default=None,
+        help="Optional maximum workspace depth in metres",
+    )
+    parser.add_argument("--depth-median-kernel", type=int, default=3)
+    parser.add_argument("--outlier-neighbors", type=int, default=20)
+    parser.add_argument("--outlier-std-ratio", type=float, default=2.0)
+    parser.add_argument("--voxel-size", type=float, default=0.002)
+    parser.add_argument("--normal-radius", type=float, default=0.01)
+    parser.add_argument("--normal-max-nn", type=int, default=30)
     parser.add_argument(
         "--coordinate-size",
         type=float,
