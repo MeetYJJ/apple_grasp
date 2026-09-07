@@ -2,6 +2,10 @@
 
 from .apple_mask import AppleMaskDetector
 from .depth_filter import DepthFilter, DepthFilterConfig
+from .depth_temporal_filter import (
+    DepthTemporalFilter,
+    DepthTemporalFilterConfig,
+)
 from .mask_process import build_valid_mask, load_mask
 from .pointcloud import (
     PointCloudData,
@@ -33,6 +37,8 @@ __all__ = [
     "InsufficientPointCloudError",
     "DepthFilter",
     "DepthFilterConfig",
+    "DepthTemporalFilter",
+    "DepthTemporalFilterConfig",
     "AppleMaskDetector",
     "YOLOAppleDetector",
     "DEFAULT_YOLO_MODEL",

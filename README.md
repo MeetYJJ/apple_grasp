@@ -13,9 +13,9 @@ Apple segmentation interface
   ↓
 Temporal mask stabilization
   ↓
-Point cloud extraction
+Mask-region depth temporal smoothing
   ↓
-ICP point-cloud fusion
+Point cloud extraction
   ↓
 GraspNet
   ↓
@@ -34,11 +34,12 @@ the current stage.
 - `perception/mask_process.py`: combines segmentation and valid-depth masks.
 - `perception/depth_filter.py`: performs configurable, edge-aware D435i depth
   preprocessing without changing depth shape, dtype, or units.
+- `perception/depth_temporal_filter.py`: applies depth EMA only in valid
+  overlap between consecutive apple masks.
 - `perception/pointcloud.py`: projects the masked depth image, applies optional
   geometric filters, records per-stage statistics, and samples model input.
-- `perception/pointcloud_temporal_filter.py`: stabilizes masks with consistency-
-  gated EMA, aligns adjacent clouds with ICP, and supplements transient point
-  deficits from aligned history.
+- `perception/pointcloud_temporal_filter.py`: selects the mask EMA weight from
+  adjacent-frame IoU so moving targets follow the current detection quickly.
 - `grasp/graspnet_runner.py`: loads GraspNet and returns a `GraspGroup`.
 - `grasp/grasp_selector.py`: selects and saves the highest-scoring grasp.
 - `grasp/grasp_pose_filter.py`: filters translation with EMA and rotation with
@@ -110,15 +111,14 @@ optional normal estimation
 Statistical outlier removal, radius outlier removal, voxel downsampling, and
 normal estimation are **disabled by default**. This conservative default keeps
 the real depth samples instead of collapsing a dense apple surface before the
-fixed-size GraspNet sampling step. Normals can be enabled for inspection and
+GraspNet sampling step. Normals can be enabled for inspection and
 are then oriented toward the camera; GraspNet still receives only XYZ (and
 optional RGB) samples, so its network and runner interface are unchanged.
 
 The previously observed `~37000 -> ~1700` collapse is consistent with a 2 mm
 voxel being applied to a close, nearly two-dimensional apple surface: many
-neighboring depth pixels fall into the same voxel. Since GraspNet is still fed
-20,000 samples afterward, that voxel step removed unique geometry without
-reducing the network input size.
+neighboring depth pixels fall into the same voxel. That voxel step removed
+unique geometry without improving the model input.
 
 The geometric stages remain available as experiment switches:
 
@@ -146,7 +146,7 @@ parameters include `--depth-median-kernel`, `--spatial-diameter`,
 does not fill across a local depth discontinuity wider than the configured
 threshold.
 
-Every processed frame reports the complete count trace:
+The point-cloud quality test reports the complete count trace:
 
 ```text
 Frame N point cloud statistics:
@@ -167,14 +167,13 @@ sampled_points: ...
 `valid depth pixels` counts original sensor measurements inside the apple mask
 before ROI cropping, `after ROI` isolates workspace-crop loss, and
 `hole-filled pixels` reports conservative interpolations separately.
-`real_points` is the number of unique filtered cloud points before fixed-size
-model sampling (and can therefore include those explicitly reported
-interpolations). A frame below 5,000 real points emits a warning; a frame below
-1,000 real points is rejected instead of silently duplicating an extremely
-sparse cloud. When upsampling is required, all real points are retained before
-the remainder is selected, and realtime sampling uses the fixed default seed
-`0` to reduce frame-to-frame sampling jitter. Change it with
-`--sampling-seed`.
+`real_points` is the number of unique filtered cloud points before model
+sampling and can include explicitly reported hole-filled measurements. A frame
+below 8,000 real points is rejected with `cloud too sparse`. From 8,000 through
+20,000 points every unique point is passed directly to GraspNet; points are
+never copied to manufacture a 20,000-point tensor. Clouds above 20,000 points
+use Open3D farthest-point sampling (FPS) to select 20,000 spatially distributed
+real samples.
 
 ### Point-cloud quality test
 
@@ -228,10 +227,9 @@ python test_pointcloud_quality.py \
 
 Each size is warmed once, then the median of three measured runs is reported.
 The no-voxel configuration remains the default because voxelization can reduce
-near-range D435i samples dramatically and does not reduce GraspNet's fixed
-20,000-point input size. Treat the sweep as a measurement for the actual camera
-distance and scene, not as a universal preset. Use `--no-display` for a
-headless count/timing run.
+near-range D435i samples dramatically. Treat the sweep as a measurement for
+the actual camera distance and scene, not as a universal preset. Use
+`--no-display` for a headless count/timing run.
 
 ## YOLOv8-seg + GraspNet pipeline
 
@@ -343,11 +341,11 @@ D435i aligned RGB-D
   ↓
 YOLOv8-seg raw apple mask
   ↓
-area/IoU-gated mask EMA
+motion-adaptive mask EMA
   ↓
-Masked metric apple point cloud
+mask-overlap depth EMA
   ↓
-previous-to-current ICP + nearest-neighbour temporal fusion
+current-frame masked metric apple point cloud
   ↓
 GraspNet candidates
   ↓
@@ -371,9 +369,8 @@ python test_realtime_grasp.py \
 ```
 
 `--yolo-model` defaults to `yolov8n-seg.pt`. It may also be set to a local
-custom segmentation checkpoint. A short detector dropout is bridged by the
-temporal mask state; after eight consecutive empty masks the state is reset
-and the frame is skipped before point-cloud creation and GraspNet inference.
+custom segmentation checkpoint. An empty current mask resets depth and grasp
+history and skips point-cloud creation and GraspNet inference.
 
 The OpenCV window shows RGB with the apple mask highlighted in green. The
 Open3D window is updated in place and shows:
@@ -392,11 +389,10 @@ T_camera_grasp = [ R  t ]
 ```
 
 Coordinate-frame axes use the Open3D convention: x is red, y is green, and z
-is blue. The terminal prints raw/stable mask area, mask IoU and effective
-current weight; raw/fused/matched/supplemented cloud counts and ICP quality;
-raw/filtered pose steps; the `3x3` rotation matrix, score, timing, and FPS. A
-rolling 100-successful-grasp-frame report compares raw and fused point-count
-variation, filtered position steps, and filtered rotation steps.
+is blue. By default the terminal prints one compact report every ten captured
+frames: frame number, FPS, mask pixels, real/model cloud points, grasp score,
+position, `3x3` rotation matrix, and total latency. Change the interval with
+`--log-interval`.
 
 Press `q`, `Esc`, or `Ctrl+C` to stop. For one headless inference iteration:
 
@@ -430,66 +426,59 @@ python test_realtime_grasp.py \
   --approach-length 0.10
 ```
 
-## Realtime temporal stability
+## Motion-adaptive realtime filtering
 
-The defaults implement the requested temporal policy:
+The mask filter compares the current raw YOLO mask with the previous raw mask,
+then selects the historical EMA weight dynamically:
 
-- mask probability EMA: `0.7 * history + 0.3 * current`;
-- mask-area anomaly bounds: `0.67` and `1.5`;
-- minimum adjacent-mask IoU: `0.3`;
-- point fusion: `0.5 * current + 0.5 * aligned_previous` for matched points;
-- low-cloud threshold: 15,000 points;
-- target temporal cloud: 20,000 points, within the configured 18,000--22,000
-  acceptance band when enough aligned history exists;
-- pose translation: `0.7 * previous + 0.3 * current`;
-- pose rotation: the same interpolation fraction using SO(3) Slerp.
+- `IoU > 0.7`: `alpha=0.5`;
+- `0.3 < IoU <= 0.7`: `alpha=0.3`;
+- `IoU <= 0.3`: `alpha=0.1`.
 
-The temporal cloud uses the previous stable cloud only after registration has
-passed ICP fitness, RMSE, translation, and rotation gates. It does not fill an
-unreliable first frame or a rejected registration by silently duplicating
-history; in those cases the existing fixed-size sampler may still repeat
-points and a warning is printed. A rejected sparse frame also cannot overwrite
-the last reliable temporal cloud, preventing one bad mask from poisoning the
-next registration.
+The update is `alpha * history + (1 - alpha) * current`, so large motion gives
+the current detection 90% weight. Point-cloud ICP and historical-cloud fusion
+have been removed: every GraspNet point comes from the current stable mask and
+current aligned depth frame.
 
-Run the requested 100-frame hardware acceptance pass without rendering cost:
+Depth smoothing uses `0.6 * previous + 0.4 * current` only where current and
+previous masks overlap, both depths are valid, and their difference is within
+80 mm. New pixels and depth discontinuities immediately use current depth. The
+plus sign is intentional; subtraction would not be a valid temporal average.
+
+Grasp output filtering remains independent: translation uses
+`0.7 * previous + 0.3 * current`, while rotation uses the same fraction with
+SO(3) Slerp.
+
+Run a 100-frame hardware check without rendering cost:
 
 ```bash
 python test_realtime_grasp.py \
   --yolo-device 0 \
   --max-frames 100 \
-  --stability-window 100 \
   --no-visualization
 ```
 
-The frame limit counts captured frames. The final acceptance report uses valid
-frames that reached GraspNet; keep running longer if detection/depth dropouts
-leave fewer than 100 successful grasps. For a strict before/after comparison,
-run the same scene first with both temporal stages disabled:
+For a strict A/B comparison, run the same target motion once with adaptive
+mask/depth filtering disabled:
 
 ```bash
 python test_realtime_grasp.py \
   --yolo-device 0 \
   --max-frames 100 \
-  --stability-window 100 \
   --disable-temporal-filter \
-  --disable-pose-filter \
   --no-visualization
 ```
 
-Useful experiment controls include `--mask-alpha`,
-`--mask-area-ratio-min`, `--mask-area-ratio-max`, `--mask-min-iou`,
-`--point-beta`, `--temporal-low-point-threshold`,
-`--temporal-icp-max-correspondence-distance`, and
-`--pose-previous-weight`. `--disable-temporal-icp` is intended only for an
-A/B diagnostic where camera and apple motion are negligible.
+Useful controls include `--mask-high-iou-alpha`,
+`--mask-medium-iou-alpha`, `--mask-low-iou-alpha`,
+`--depth-temporal-previous-weight`, `--depth-temporal-max-delta-mm`, and
+`--pose-previous-weight`.
 
 ## Hardware acceptance measurements
 
-The design target for an apple mask of roughly 40,000 pixels is more than
-10,000 real current-frame points before temporal fusion, less than 15% fused
-point-count variation over 100 valid frames, less than 5 cm maximum filtered
-position step, smooth rotation steps, and continued
+The design target for an apple mask of roughly 40,000 pixels is at least 8,000
+real current-frame points, low mask tracking delay during target motion,
+smooth depth and pose changes, and continued
 `position`/`rotation`/`score` output. These are **acceptance targets, not
 measurements claimed by this repository**. They must be verified on Ubuntu
 with the intended D435i, scene geometry, YOLO checkpoint, CUDA device, and

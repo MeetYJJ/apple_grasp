@@ -60,8 +60,8 @@ class PointCloudConfig:
     normal_radius: float = 0.01
     normal_max_nn: int = 30
 
-    min_real_points_warning: int = 5000
-    min_real_points_reject: int = 1000
+    min_real_points_warning: int = 8000
+    min_real_points_reject: int = 8000
 
     def __post_init__(self) -> None:
         if self.workspace_roi is not None and len(self.workspace_roi) != 4:
@@ -121,9 +121,9 @@ class PointCloudConfig:
             raise ValueError("normal_max_nn must be positive")
         if self.min_real_points_reject < 1:
             raise ValueError("min_real_points_reject must be positive")
-        if self.min_real_points_warning <= self.min_real_points_reject:
+        if self.min_real_points_warning < self.min_real_points_reject:
             raise ValueError(
-                "min_real_points_warning must exceed min_real_points_reject"
+                "min_real_points_warning must be at least min_real_points_reject"
             )
 
     def make_depth_filter(self) -> DepthFilter:
@@ -246,7 +246,7 @@ class PointCloudStats:
 
 @dataclass(frozen=True)
 class PointCloudData:
-    """Fixed-size model input with optional RGB colors in ``[0, 1]``."""
+    """Unique-point model input with optional RGB colors in ``[0, 1]``."""
 
     points: np.ndarray
     colors: Optional[np.ndarray] = None
@@ -416,18 +416,23 @@ def sample_point_cloud(
     num_points: int = 20000,
     seed: Optional[int] = None,
     stats: Optional[PointCloudStats] = None,
-    min_real_points_warning: int = 5000,
-    min_real_points_reject: int = 1000,
+    min_real_points_warning: int = 8000,
+    min_real_points_reject: int = 8000,
 ) -> PointCloudData:
-    """Create fixed-size input while warning/rejecting sparse real clouds."""
+    """Create a unique-point GraspNet input without synthetic duplication.
+
+    Clouds below ``num_points`` retain all real points and therefore produce a
+    variable-size model input. Larger clouds use Open3D farthest-point sampling
+    when available. No branch samples with replacement.
+    """
 
     if num_points <= 0:
         raise ValueError("num_points must be positive")
     if min_real_points_reject < 1:
         raise ValueError("min_real_points_reject must be positive")
-    if min_real_points_warning <= min_real_points_reject:
+    if min_real_points_warning < min_real_points_reject:
         raise ValueError(
-            "min_real_points_warning must exceed min_real_points_reject"
+            "min_real_points_warning must be at least min_real_points_reject"
         )
 
     points = np.asarray(cloud.points, dtype=np.float32)
@@ -444,7 +449,7 @@ def sample_point_cloud(
         stats.sampled_points = 0
     if real_point_count < min_real_points_reject:
         message = (
-            "Rejecting frame with {} real points; minimum is {}".format(
+            "cloud too sparse: {} real points; minimum is {}".format(
                 real_point_count, min_real_points_reject
             )
         )
@@ -452,27 +457,36 @@ def sample_point_cloud(
             stats.warning_message = message
         raise InsufficientPointCloudError(message)
     if real_point_count < min_real_points_warning:
-        message = (
-            "Sparse cloud has {} real points; repeated sampling to {} may "
-            "reduce grasp stability".format(real_point_count, num_points)
-        )
+        message = "Sparse cloud has {} real points".format(real_point_count)
         if stats is not None:
             stats.warning_message = message
         warnings.warn(message, RuntimeWarning, stacklevel=2)
 
-    rng = np.random.default_rng(seed)
-    if real_point_count >= num_points:
-        indices = rng.choice(real_point_count, num_points, replace=False)
+    sampled_cloud = None
+    if real_point_count > num_points:
+        fps_method = getattr(cloud, "farthest_point_down_sample", None)
+        if callable(fps_method):
+            sampled_cloud = fps_method(num_points)
+            sampled_points = np.asarray(
+                sampled_cloud.points, dtype=np.float32
+            )
+            if len(sampled_points) != num_points:
+                raise RuntimeError(
+                    "Open3D FPS returned {} points instead of {}".format(
+                        len(sampled_points), num_points
+                    )
+                )
+        else:
+            # Compatibility fallback for point-cloud implementations without
+            # Open3D FPS. Sampling remains without replacement.
+            rng = np.random.default_rng(seed)
+            indices = rng.choice(
+                real_point_count, num_points, replace=False
+            )
+            sampled_points = points[indices]
     else:
-        # Repeat every real point evenly before adding a non-repeating
-        # remainder. This avoids the highly uneven duplicate distribution of
-        # one large random choice when the cloud is sparse.
-        full_repeats, remainder = divmod(num_points, real_point_count)
-        indices = np.tile(np.arange(real_point_count), full_repeats)
-        if remainder:
-            tail = rng.choice(real_point_count, remainder, replace=False)
-            indices = np.concatenate((indices, tail))
-        rng.shuffle(indices)
+        indices = np.arange(real_point_count)
+        sampled_points = points
 
     sampled_colors = None
     has_colors_method = getattr(cloud, "has_colors", None)
@@ -483,13 +497,22 @@ def sample_point_cloud(
         else color_data is not None and len(color_data) > 0
     )
     if has_colors:
-        colors = np.asarray(color_data, dtype=np.float32)
-        if len(colors) != real_point_count:
-            raise ValueError("Point and color counts must match")
-        sampled_colors = np.ascontiguousarray(colors[indices], dtype=np.float32)
+        if sampled_cloud is not None and sampled_cloud.has_colors():
+            sampled_colors = np.asarray(
+                sampled_cloud.colors, dtype=np.float32
+            )
+        elif sampled_cloud is not None:
+            sampled_colors = None
+        else:
+            colors = np.asarray(color_data, dtype=np.float32)
+            if len(colors) != real_point_count:
+                raise ValueError("Point and color counts must match")
+            sampled_colors = np.ascontiguousarray(
+                colors[indices], dtype=np.float32
+            )
 
     result = PointCloudData(
-        points=np.ascontiguousarray(points[indices], dtype=np.float32),
+        points=np.ascontiguousarray(sampled_points, dtype=np.float32),
         colors=sampled_colors,
     )
     if stats is not None:

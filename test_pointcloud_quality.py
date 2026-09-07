@@ -811,8 +811,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-normal-estimation", action="store_true")
     parser.add_argument("--normal-radius", type=float, default=0.01)
     parser.add_argument("--normal-max-nn", type=int, default=30)
-    parser.add_argument("--min-real-points-warning", type=int, default=5000)
-    parser.add_argument("--min-real-points-reject", type=int, default=1000)
+    parser.add_argument("--min-real-points-warning", type=int, default=8000)
+    parser.add_argument("--min-real-points-reject", type=int, default=8000)
 
     parser.add_argument("--voxel-sweep", action="store_true")
     parser.add_argument(
