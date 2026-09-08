@@ -63,10 +63,11 @@ class GraspVisualizer:
         window_name: str = "Apple point cloud and best grasp",
         width: int = 960,
         height: int = 720,
-        point_size: float = 2.0,
+        point_size: float = 4.0,
         camera_frame_size: float = 0.10,
-        grasp_frame_size: float = 0.06,
-        approach_length: float = 0.10,
+        grasp_frame_size: float = 0.18,
+        approach_length: float = 0.20,
+        auto_track: bool = True,
     ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("window width and height must be positive")
@@ -78,8 +79,10 @@ class GraspVisualizer:
             raise ValueError("approach_length must be positive")
 
         self.enabled = bool(enabled)
+        self.camera_frame_size = float(camera_frame_size)
         self.grasp_frame_size = float(grasp_frame_size)
         self.approach_length = float(approach_length)
+        self.auto_track = bool(auto_track)
         self.last_grasp_transform: Optional[np.ndarray] = None
         self.last_approach_direction: Optional[np.ndarray] = None
 
@@ -89,6 +92,15 @@ class GraspVisualizer:
         self._point_cloud = None
         self._grasp_frame = None
         self._approach_arrow = None
+        self._bounding_box = None
+        self._point_cloud_added = False
+        self._bounding_box_added = False
+        self._grasp_frame_added = False
+        self._approach_arrow_added = False
+        self._grasp_vertices = None
+        self._grasp_normals = None
+        self._arrow_vertices = None
+        self._arrow_normals = None
 
         if not self.enabled:
             return
@@ -111,7 +123,11 @@ class GraspVisualizer:
         self._camera_frame = self._o3d.geometry.TriangleMesh.create_coordinate_frame(
             size=float(camera_frame_size), origin=[0.0, 0.0, 0.0]
         )
-        self._visualizer.add_geometry(self._camera_frame, reset_bounding_box=True)
+        self._visualizer.add_geometry(
+            self._camera_frame, reset_bounding_box=False
+        )
+        self._point_cloud = self._o3d.geometry.PointCloud()
+        self._bounding_box = self._o3d.geometry.LineSet()
 
     def update(
         self,
@@ -127,7 +143,6 @@ class GraspVisualizer:
             return True
 
         self._update_point_cloud(point_cloud)
-        self._remove_dynamic_pose()
 
         if position is not None and rotation is not None:
             transform = build_grasp_transform(position, rotation)
@@ -135,24 +150,8 @@ class GraspVisualizer:
             self.last_grasp_transform = transform.copy()
             self.last_approach_direction = approach.copy()
 
-            self._grasp_frame = (
-                self._o3d.geometry.TriangleMesh.create_coordinate_frame(
-                    size=self.grasp_frame_size
-                )
-            )
-            self._grasp_frame.transform(transform)
-            self._approach_arrow = self._create_approach_arrow(
-                transform[:3, 3], approach
-            )
-            self._visualizer.add_geometry(
-                self._grasp_frame, reset_bounding_box=False
-            )
-            self._visualizer.add_geometry(
-                self._approach_arrow, reset_bounding_box=False
-            )
-        else:
-            self.last_grasp_transform = None
-            self.last_approach_direction = None
+            self._update_grasp_frame(transform)
+            self._update_approach_arrow(transform[:3, 3], approach)
 
         window_alive = self._visualizer.poll_events()
         self._visualizer.update_renderer()
@@ -167,62 +166,153 @@ class GraspVisualizer:
 
     def _update_point_cloud(self, point_cloud: Optional[Any]) -> None:
         if point_cloud is None:
-            if self._point_cloud is not None:
-                self._visualizer.remove_geometry(
-                    self._point_cloud, reset_bounding_box=False
-                )
-                self._point_cloud = None
             return
 
         points, colors = self._extract_cloud_arrays(point_cloud)
-        first_cloud = self._point_cloud is None
-        if first_cloud:
-            self._point_cloud = self._o3d.geometry.PointCloud()
-
         self._point_cloud.points = self._o3d.utility.Vector3dVector(points)
         if colors is None:
             self._point_cloud.colors = self._o3d.utility.Vector3dVector()
         else:
             self._point_cloud.colors = self._o3d.utility.Vector3dVector(colors)
 
-        if first_cloud:
+        if not self._point_cloud_added:
             self._visualizer.add_geometry(
                 self._point_cloud, reset_bounding_box=True
             )
+            self._point_cloud_added = True
         else:
             self._visualizer.update_geometry(self._point_cloud)
 
-    def _remove_dynamic_pose(self) -> None:
-        for attribute in ("_grasp_frame", "_approach_arrow"):
-            geometry = getattr(self, attribute)
-            if geometry is not None:
-                self._visualizer.remove_geometry(
-                    geometry, reset_bounding_box=False
-                )
-                setattr(self, attribute, None)
+        self._update_bounding_box(points)
+        if self.auto_track:
+            self._update_view(points)
 
-    def _create_approach_arrow(
+    def _update_grasp_frame(self, transform: np.ndarray) -> None:
+        if self._grasp_frame is None:
+            self._grasp_frame = (
+                self._o3d.geometry.TriangleMesh.create_coordinate_frame(
+                    size=self.grasp_frame_size
+                )
+            )
+            self._grasp_vertices = np.asarray(
+                self._grasp_frame.vertices
+            ).copy()
+            self._grasp_normals = np.asarray(
+                self._grasp_frame.vertex_normals
+            ).copy()
+
+        rotation = transform[:3, :3]
+        translation = transform[:3, 3]
+        vertices = self._grasp_vertices @ rotation.T + translation
+        normals = self._grasp_normals @ rotation.T
+        self._grasp_frame.vertices = self._o3d.utility.Vector3dVector(vertices)
+        self._grasp_frame.vertex_normals = self._o3d.utility.Vector3dVector(
+            normals
+        )
+        if not self._grasp_frame_added:
+            self._visualizer.add_geometry(
+                self._grasp_frame, reset_bounding_box=False
+            )
+            self._grasp_frame_added = True
+        else:
+            self._visualizer.update_geometry(self._grasp_frame)
+
+    def _update_approach_arrow(
         self, position: np.ndarray, approach: np.ndarray
-    ) -> Any:
+    ) -> None:
         cone_height = self.approach_length * 0.25
         cylinder_height = self.approach_length - cone_height
         cylinder_radius = max(self.approach_length * 0.025, 0.001)
         cone_radius = cylinder_radius * 2.0
-        arrow = self._o3d.geometry.TriangleMesh.create_arrow(
-            cylinder_radius=cylinder_radius,
-            cone_radius=cone_radius,
-            cylinder_height=cylinder_height,
-            cone_height=cone_height,
-        )
-        arrow.compute_vertex_normals()
-        arrow.paint_uniform_color([1.0, 0.75, 0.0])
+        if self._approach_arrow is None:
+            self._approach_arrow = self._o3d.geometry.TriangleMesh.create_arrow(
+                cylinder_radius=cylinder_radius,
+                cone_radius=cone_radius,
+                cylinder_height=cylinder_height,
+                cone_height=cone_height,
+            )
+            self._approach_arrow.compute_vertex_normals()
+            self._approach_arrow.paint_uniform_color([1.0, 0.75, 0.0])
+            self._arrow_vertices = np.asarray(
+                self._approach_arrow.vertices
+            ).copy()
+            self._arrow_normals = np.asarray(
+                self._approach_arrow.vertex_normals
+            ).copy()
 
         # Open3D arrows point along +Z. Place the tail behind the target so the
         # yellow arrow points along grasp +X and its tip ends at the grasp point.
         align_rotation = self._rotation_from_z_axis(approach)
-        arrow.rotate(align_rotation, center=[0.0, 0.0, 0.0])
-        arrow.translate(position - approach * self.approach_length)
-        return arrow
+        tail = position - approach * self.approach_length
+        vertices = self._arrow_vertices @ align_rotation.T + tail
+        normals = self._arrow_normals @ align_rotation.T
+        self._approach_arrow.vertices = self._o3d.utility.Vector3dVector(
+            vertices
+        )
+        self._approach_arrow.vertex_normals = (
+            self._o3d.utility.Vector3dVector(normals)
+        )
+        if not self._approach_arrow_added:
+            self._visualizer.add_geometry(
+                self._approach_arrow, reset_bounding_box=False
+            )
+            self._approach_arrow_added = True
+        else:
+            self._visualizer.update_geometry(self._approach_arrow)
+
+    def _update_bounding_box(self, points: np.ndarray) -> None:
+        minimum = points.min(axis=0)
+        maximum = points.max(axis=0)
+        x0, y0, z0 = minimum
+        x1, y1, z1 = maximum
+        corners = np.asarray(
+            [
+                [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+                [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+            ],
+            dtype=np.float64,
+        )
+        lines = np.asarray(
+            [
+                [0, 1], [1, 2], [2, 3], [3, 0],
+                [4, 5], [5, 6], [6, 7], [7, 4],
+                [0, 4], [1, 5], [2, 6], [3, 7],
+            ],
+            dtype=np.int32,
+        )
+        self._bounding_box.points = self._o3d.utility.Vector3dVector(corners)
+        self._bounding_box.lines = self._o3d.utility.Vector2iVector(lines)
+        self._bounding_box.colors = self._o3d.utility.Vector3dVector(
+            np.tile([0.0, 1.0, 1.0], (len(lines), 1))
+        )
+        if not self._bounding_box_added:
+            self._visualizer.add_geometry(
+                self._bounding_box, reset_bounding_box=False
+            )
+            self._bounding_box_added = True
+        else:
+            self._visualizer.update_geometry(self._bounding_box)
+
+    def _update_view(self, points: np.ndarray) -> None:
+        centroid = points.mean(axis=0)
+        extent = points.max(axis=0) - points.min(axis=0)
+        object_size = max(float(np.max(extent)), 0.01)
+        focus_size = max(
+            object_size, self.grasp_frame_size, self.approach_length
+        )
+        # Open3D's zoom is relative to the full scene bounding box, which also
+        # contains the coordinate frame at the camera origin. Compensate for
+        # that camera-to-object span so it cannot make the apple look tiny.
+        scene_span = max(
+            float(np.linalg.norm(centroid)) + self.camera_frame_size,
+            focus_size,
+        )
+        zoom = float(np.clip(focus_size / (0.75 * scene_span), 0.05, 0.8))
+        view = self._visualizer.get_view_control()
+        view.set_lookat(centroid.tolist())
+        view.set_front([0.0, 0.0, -1.0])
+        view.set_up([0.0, -1.0, 0.0])
+        view.set_zoom(zoom)
 
     @staticmethod
     def _rotation_from_z_axis(direction: np.ndarray) -> np.ndarray:
@@ -237,7 +327,9 @@ class GraspVisualizer:
         return np.column_stack((x_axis, y_axis, z_axis))
 
     @staticmethod
-    def _extract_cloud_arrays(point_cloud: Any) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    def _extract_cloud_arrays(
+        point_cloud: Any,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         if isinstance(point_cloud, np.ndarray):
             points = np.asarray(point_cloud, dtype=np.float64)
             colors = None

@@ -23,6 +23,8 @@ class RealSenseCamera:
         fps: int = 30,
         serial_number: Optional[str] = None,
         timeout_ms: int = 5000,
+        enable_depth_postprocessing: bool = True,
+        decimation_magnitude: int = 1,
     ) -> None:
         """Initialize and start the D435i color/depth pipeline."""
 
@@ -30,6 +32,8 @@ class RealSenseCamera:
             raise ValueError("width, height and fps must be positive")
         if timeout_ms <= 0:
             raise ValueError("timeout_ms must be positive")
+        if decimation_magnitude not in (1, 2, 3, 4, 5, 6, 7, 8):
+            raise ValueError("decimation_magnitude must be in [1, 8]")
 
         try:
             import pyrealsense2 as rs
@@ -44,6 +48,8 @@ class RealSenseCamera:
         self.height = int(height)
         self.fps = int(fps)
         self.timeout_ms = int(timeout_ms)
+        self.enable_depth_postprocessing = bool(enable_depth_postprocessing)
+        self.decimation_magnitude = int(decimation_magnitude)
         self._pipeline = rs.pipeline()
         self._config = rs.config()
         if serial_number:
@@ -89,6 +95,8 @@ class RealSenseCamera:
             )
             self.depth_scale = 0.001
             self._align = rs.align(rs.stream.color)
+            if self.enable_depth_postprocessing:
+                self._configure_depth_filters()
         except Exception:
             self.stop()
             raise
@@ -107,12 +115,24 @@ class RealSenseCamera:
             if not depth_frame or not color_frame:
                 continue
 
+            if self.enable_depth_postprocessing:
+                depth_frame = self._filter_depth_frame(depth_frame)
+
             depth_raw = np.asanyarray(depth_frame.get_data())
             color_bgr = np.asanyarray(color_frame.get_data())
             if depth_raw.ndim != 2 or color_bgr.ndim != 3:
                 continue
             if depth_raw.shape != color_bgr.shape[:2]:
-                continue
+                # Decimation changes depth resolution. Restore the aligned
+                # color resolution with nearest-neighbour interpolation so
+                # millimetre values and pixel correspondence remain discrete.
+                import cv2
+
+                depth_raw = cv2.resize(
+                    depth_raw,
+                    (color_bgr.shape[1], color_bgr.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
 
             rgb = np.ascontiguousarray(color_bgr[..., ::-1], dtype=np.uint8)
             millimetres_per_unit = self._native_depth_scale * 1000.0
@@ -125,6 +145,38 @@ class RealSenseCamera:
             return rgb, depth_mm
 
         raise RuntimeError("Failed to obtain a valid aligned RGB-D frame")
+
+    def _configure_depth_filters(self) -> None:
+        """Create persistent librealsense filters once, not per frame."""
+
+        rs = self._rs
+        self._decimation_filter = rs.decimation_filter()
+        if self.decimation_magnitude > 1:
+            self._decimation_filter.set_option(
+                rs.option.filter_magnitude, float(self.decimation_magnitude)
+            )
+
+        self._spatial_filter = rs.spatial_filter()
+        self._spatial_filter.set_option(rs.option.filter_magnitude, 2.0)
+        self._spatial_filter.set_option(rs.option.filter_smooth_alpha, 0.5)
+        self._spatial_filter.set_option(rs.option.filter_smooth_delta, 20.0)
+        self._spatial_filter.set_option(rs.option.holes_fill, 2.0)
+
+        self._temporal_filter = rs.temporal_filter()
+        self._temporal_filter.set_option(rs.option.filter_smooth_alpha, 0.4)
+        self._temporal_filter.set_option(rs.option.filter_smooth_delta, 20.0)
+
+        self._hole_filling_filter = rs.hole_filling_filter(1)
+
+    def _filter_depth_frame(self, depth_frame):
+        """Apply the RealSense depth post-processing chain."""
+
+        filtered = depth_frame
+        if self.decimation_magnitude > 1:
+            filtered = self._decimation_filter.process(filtered)
+        filtered = self._spatial_filter.process(filtered)
+        filtered = self._temporal_filter.process(filtered)
+        return self._hole_filling_filter.process(filtered)
 
     def stop(self) -> None:
         """Stop streaming. Calling this method more than once is safe."""

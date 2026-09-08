@@ -386,7 +386,8 @@ def print_stability(
     )
     if len(counts) < 10:
         print(
-            "peak-to-peak variation: {:.1f}% (NOT EVALUATED: need 10 valid frames)".format(
+            "peak-to-peak variation: {:.1f}% "
+            "(NOT EVALUATED: need 10 valid frames)".format(
                 variation * 100.0
             )
         )
@@ -812,7 +813,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normal-radius", type=float, default=0.01)
     parser.add_argument("--normal-max-nn", type=int, default=30)
     parser.add_argument("--min-real-points-warning", type=int, default=8000)
-    parser.add_argument("--min-real-points-reject", type=int, default=8000)
+    parser.add_argument("--min-real-points-reject", type=int, default=2048)
 
     parser.add_argument("--voxel-sweep", action="store_true")
     parser.add_argument(

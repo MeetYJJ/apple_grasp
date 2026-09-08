@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Deque, Dict, Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -18,17 +19,26 @@ class GraspPoseFilterStats:
 
 
 class GraspPoseFilter:
-    """Smooth translation with EMA and rotation on the SO(3) manifold.
+    """Smooth translation by moving average and rotation on SO(3).
 
-    ``previous_weight=0.7`` implements ``p = 0.7*p_previous +
-    0.3*p_current``. Rotation uses the same current-frame fraction through
-    SciPy Slerp; rotation matrices are never averaged element by element.
+    Position uses the most recent ``position_window_size`` valid predictions.
+    Rotation uses incremental SciPy Slerp and is never averaged element-wise.
     """
 
-    def __init__(self, previous_weight: float = 0.7) -> None:
+    def __init__(
+        self,
+        previous_weight: float = 0.7,
+        position_window_size: int = 5,
+    ) -> None:
         if not 0.0 <= previous_weight < 1.0:
             raise ValueError("previous_weight must be in [0, 1)")
+        if position_window_size < 1:
+            raise ValueError("position_window_size must be positive")
         self.previous_weight = float(previous_weight)
+        self.position_window_size = int(position_window_size)
+        self._position_history: Deque[np.ndarray] = deque(
+            maxlen=self.position_window_size
+        )
         self.previous_position: Optional[np.ndarray] = None
         self.previous_rotation: Optional[np.ndarray] = None
         self.previous_raw_position: Optional[np.ndarray] = None
@@ -36,6 +46,7 @@ class GraspPoseFilter:
         self.last_stats = GraspPoseFilterStats()
 
     def reset(self) -> None:
+        self._position_history.clear()
         self.previous_position = None
         self.previous_rotation = None
         self.previous_raw_position = None
@@ -61,17 +72,16 @@ class GraspPoseFilter:
         ):
             raise ValueError("grasp pose contains NaN or infinite values")
         raw_rotation = self._project_to_so3(raw_rotation)
+        self._position_history.append(raw_position.copy())
+        filtered_position = np.mean(
+            np.stack(tuple(self._position_history), axis=0), axis=0
+        )
 
         if self.previous_position is None or self.previous_rotation is None:
-            filtered_position = raw_position.copy()
             filtered_rotation = raw_rotation.copy()
             stats = GraspPoseFilterStats()
         else:
             current_weight = 1.0 - self.previous_weight
-            filtered_position = (
-                self.previous_weight * self.previous_position
-                + current_weight * raw_position
-            )
             key_rotations = Rotation.from_matrix(
                 np.stack((self.previous_rotation, raw_rotation), axis=0)
             )

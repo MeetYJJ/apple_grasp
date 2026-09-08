@@ -31,8 +31,8 @@ class PointCloudConfig:
     """
 
     workspace_roi: Optional[Tuple[int, int, int, int]] = None
-    min_depth_m: Optional[float] = None
-    max_depth_m: Optional[float] = None
+    min_depth_m: Optional[float] = 0.25
+    max_depth_m: Optional[float] = 2.0
 
     enable_depth_preprocessing: bool = True
     enable_median_filter: bool = True
@@ -61,7 +61,7 @@ class PointCloudConfig:
     normal_max_nn: int = 30
 
     min_real_points_warning: int = 8000
-    min_real_points_reject: int = 8000
+    min_real_points_reject: int = 2048
 
     def __post_init__(self) -> None:
         if self.workspace_roi is not None and len(self.workspace_roi) != 4:
@@ -252,6 +252,33 @@ class PointCloudData:
     colors: Optional[np.ndarray] = None
 
 
+def calculate_valid_depth_ratio(
+    depth: np.ndarray,
+    mask: np.ndarray,
+    min_depth_mm: float = 250.0,
+    max_depth_mm: float = 2000.0,
+) -> Tuple[int, int, float]:
+    """Return ``(mask_pixels, valid_pixels, ratio)`` for millimetre depth."""
+
+    depth_array = np.asarray(depth)
+    mask_array = np.asarray(mask, dtype=bool)
+    if depth_array.ndim != 2 or mask_array.shape != depth_array.shape:
+        raise ValueError("depth and mask must have matching (H, W) shapes")
+    if not 0 <= min_depth_mm < max_depth_mm:
+        raise ValueError("depth limits must satisfy 0 <= min < max")
+
+    mask_pixels = int(mask_array.sum())
+    valid = (
+        mask_array
+        & np.isfinite(depth_array)
+        & (depth_array > min_depth_mm)
+        & (depth_array < max_depth_mm)
+    )
+    valid_pixels = int(valid.sum())
+    ratio = 0.0 if mask_pixels == 0 else valid_pixels / float(mask_pixels)
+    return mask_pixels, valid_pixels, ratio
+
+
 def create_point_cloud(
     depth: np.ndarray,
     intrinsic: np.ndarray,
@@ -318,9 +345,9 @@ def create_point_cloud(
 
     range_mask = np.ones(len(points), dtype=bool)
     if cloud_config.min_depth_m is not None:
-        range_mask &= points[:, 2] >= cloud_config.min_depth_m
+        range_mask &= points[:, 2] > cloud_config.min_depth_m
     if cloud_config.max_depth_m is not None:
-        range_mask &= points[:, 2] <= cloud_config.max_depth_m
+        range_mask &= points[:, 2] < cloud_config.max_depth_m
     points = points[range_mask]
     if colors is not None:
         colors = colors[range_mask]
@@ -417,7 +444,7 @@ def sample_point_cloud(
     seed: Optional[int] = None,
     stats: Optional[PointCloudStats] = None,
     min_real_points_warning: int = 8000,
-    min_real_points_reject: int = 8000,
+    min_real_points_reject: int = 2048,
 ) -> PointCloudData:
     """Create a unique-point GraspNet input without synthetic duplication.
 

@@ -19,7 +19,7 @@ Point cloud extraction
   ↓
 GraspNet
   ↓
-EMA/Slerp-filtered best grasp
+moving-average/Slerp-filtered best grasp
 ```
 
 The resulting position and rotation are expressed in the camera coordinate
@@ -42,8 +42,8 @@ the current stage.
   adjacent-frame IoU so moving targets follow the current detection quickly.
 - `grasp/graspnet_runner.py`: loads GraspNet and returns a `GraspGroup`.
 - `grasp/grasp_selector.py`: selects and saves the highest-scoring grasp.
-- `grasp/grasp_pose_filter.py`: filters translation with EMA and rotation with
-  SO(3) Slerp; it never averages rotation-matrix elements.
+- `grasp/grasp_pose_filter.py`: filters translation with a moving average and
+  rotation with SO(3) Slerp; it never averages rotation-matrix elements.
 - `visualization/grasp_visualizer.py`: updates the Open3D cloud, camera frame,
   grasp frame, and grasp-approach arrow.
 
@@ -146,6 +146,12 @@ parameters include `--depth-median-kernel`, `--spatial-diameter`,
 does not fill across a local depth discontinuity wider than the configured
 threshold.
 
+The realtime pipeline now relies on the persistent RealSense SDK filters and
+disables this additional CPU preprocessing by default to avoid filtering the
+same 640x480 depth frame twice. Use `--enable-depth-preprocessing` only for an
+A/B quality measurement; the standalone point-cloud quality test keeps its
+original configurable CPU path.
+
 The point-cloud quality test reports the complete count trace:
 
 ```text
@@ -169,11 +175,11 @@ before ROI cropping, `after ROI` isolates workspace-crop loss, and
 `hole-filled pixels` reports conservative interpolations separately.
 `real_points` is the number of unique filtered cloud points before model
 sampling and can include explicitly reported hole-filled measurements. A frame
-below 8,000 real points is rejected with `cloud too sparse`. From 8,000 through
-20,000 points every unique point is passed directly to GraspNet; points are
-never copied to manufacture a 20,000-point tensor. Clouds above 20,000 points
-use Open3D farthest-point sampling (FPS) to select 20,000 spatially distributed
-real samples.
+below 2,048 real points is rejected with `cloud too sparse`; below 8,000 it
+emits a quality warning. From 2,048 through 20,000 points every unique point is
+passed directly to GraspNet; points are never copied to manufacture a
+20,000-point tensor. Clouds above 20,000 points use Open3D farthest-point
+sampling (FPS) to select 20,000 spatially distributed real samples.
 
 ### Point-cloud quality test
 
@@ -299,6 +305,13 @@ the same format as the offline loader:
 - `camera.intrinsic`: aligned color-camera `3x3` intrinsic matrix.
 - `camera.depth_scale`: `0.001` metres per millimetre for point-cloud creation.
 
+The camera adapter creates one persistent RealSense post-processing chain:
+decimation, spatial smoothing, temporal smoothing, and hole filling. The
+default decimation magnitude is `1` to retain all scarce close-range depth
+pixels; set `--decimation-magnitude 2` only when profiling shows that reduced
+resolution is acceptable. Disable the complete SDK chain with
+`--disable-realsense-depth-filters`.
+
 Install the RealSense Python binding and the OpenCV viewer dependency:
 
 ```bash
@@ -349,7 +362,7 @@ current-frame masked metric apple point cloud
   ↓
 GraspNet candidates
   ↓
-highest-scoring grasp + position EMA/rotation Slerp
+highest-scoring grasp + position moving average/rotation Slerp
 ```
 
 Run the complete chain with the public COCO model:
@@ -372,11 +385,19 @@ python test_realtime_grasp.py \
 custom segmentation checkpoint. An empty current mask resets depth and grasp
 history and skips point-cloud creation and GraspNet inference.
 
+Depth is accepted only within 250--2000 mm. Before point-cloud construction the
+pipeline computes `valid_depth_pixels / mask_pixels`; when it is below `0.20`,
+GraspNet is skipped and the last valid cloud and grasp remain visible. The same
+hold-last behavior is used below 2,048 real cloud points, which is the minimum
+accepted by the unchanged `GraspNetRunner`. This prevents close-
+range D435i holes from producing an expensive, meaningless inference.
+
 The OpenCV window shows RGB with the apple mask highlighted in green. The
 Open3D window is updated in place and shows:
 
 - the RGB-colored apple point cloud;
 - the camera coordinate frame at the origin;
+- a cyan apple axis-aligned bounding box;
 - the best-grasp coordinate frame transformed by `T_camera_grasp`;
 - a yellow approach arrow pointing along GraspNet grasp +X (`R[:, 0]`) toward
   the grasp position.
@@ -389,10 +410,14 @@ T_camera_grasp = [ R  t ]
 ```
 
 Coordinate-frame axes use the Open3D convention: x is red, y is green, and z
-is blue. By default the terminal prints one compact report every ten captured
-frames: frame number, FPS, mask pixels, real/model cloud points, grasp score,
-position, `3x3` rotation matrix, and total latency. Change the interval with
-`--log-interval`.
+is blue. The Open3D view looks at the current cloud centroid and derives zoom
+from its bounding-box extent, so the apple remains prominent as distance
+changes. Point cloud, bounding box, grasp frame, and approach arrow objects are
+allocated once and subsequently changed with `update_geometry()`; no geometry
+is removed and recreated per frame. By default the terminal prints one compact
+report every ten captured frames: frame number, FPS, mask pixels, valid-depth
+ratio, real/model cloud points, grasp score, position, `3x3` rotation matrix,
+and total latency. Change the interval with `--log-interval`.
 
 Press `q`, `Esc`, or `Ctrl+C` to stop. For one headless inference iteration:
 
@@ -422,8 +447,8 @@ Visualization sizes can be adjusted without changing inference:
 python test_realtime_grasp.py \
   --yolo-device 0 \
   --camera-coordinate-size 0.10 \
-  --coordinate-size 0.06 \
-  --approach-length 0.10
+  --coordinate-size 0.18 \
+  --approach-length 0.20
 ```
 
 ## Motion-adaptive realtime filtering
@@ -445,9 +470,8 @@ previous masks overlap, both depths are valid, and their difference is within
 80 mm. New pixels and depth discontinuities immediately use current depth. The
 plus sign is intentional; subtraction would not be a valid temporal average.
 
-Grasp output filtering remains independent: translation uses
-`0.7 * previous + 0.3 * current`, while rotation uses the same fraction with
-SO(3) Slerp.
+Grasp output filtering remains independent: translation uses a five-valid-frame
+moving average, while rotation uses incremental SO(3) Slerp.
 
 Run a 100-frame hardware check without rendering cost:
 
@@ -476,8 +500,8 @@ Useful controls include `--mask-high-iou-alpha`,
 
 ## Hardware acceptance measurements
 
-The design target for an apple mask of roughly 40,000 pixels is at least 8,000
-real current-frame points, low mask tracking delay during target motion,
+The design target is at least 20% in-range depth coverage inside the mask and
+at least 2,048 real points before inference, low tracking delay during motion,
 smooth depth and pose changes, and continued
 `position`/`rotation`/`score` output. These are **acceptance targets, not
 measurements claimed by this repository**. They must be verified on Ubuntu

@@ -23,6 +23,7 @@ from perception.pointcloud import (
     InsufficientPointCloudError,
     PointCloudConfig,
     PointCloudStats,
+    calculate_valid_depth_ratio,
     create_point_cloud,
     sample_point_cloud,
 )
@@ -85,6 +86,7 @@ def print_frame_summary(
     frame_index: int,
     fps: float,
     mask_pixels: int,
+    valid_depth_ratio: float,
     real_points: int,
     model_points: int,
     best_grasp: Dict[str, object],
@@ -93,6 +95,7 @@ def print_frame_summary(
     print("Frame: {}".format(frame_index))
     print("FPS: {:.2f}".format(fps))
     print("mask pixels: {}".format(mask_pixels))
+    print("valid depth ratio: {:.1%}".format(valid_depth_ratio))
     print(
         "cloud points: {} real / {} GraspNet input".format(
             real_points, model_points
@@ -117,6 +120,8 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--approach-length must be positive")
     if args.log_interval < 1:
         raise ValueError("--log-interval must be positive")
+    if not 0.0 <= args.min_valid_depth_ratio <= 1.0:
+        raise ValueError("--min-valid-depth-ratio must be in [0, 1]")
 
     pointcloud_config = PointCloudConfig(
         median_kernel=args.depth_median_kernel,
@@ -125,7 +130,7 @@ def run(args: argparse.Namespace) -> None:
         ),
         min_depth_m=args.min_depth,
         max_depth_m=args.max_depth,
-        enable_depth_preprocessing=not args.disable_depth_preprocessing,
+        enable_depth_preprocessing=args.enable_cpu_depth_preprocessing,
         enable_median_filter=not args.disable_median_filter,
         enable_spatial_smoothing=not args.disable_spatial_smoothing,
         spatial_diameter=args.spatial_diameter,
@@ -175,7 +180,10 @@ def run(args: argparse.Namespace) -> None:
     grasp_selector = GraspSelector()
     temporal_filter = TemporalPointCloudFilter(temporal_config)
     depth_temporal_filter = DepthTemporalFilter(depth_temporal_config)
-    pose_filter = GraspPoseFilter(previous_weight=args.pose_previous_weight)
+    pose_filter = GraspPoseFilter(
+        previous_weight=args.pose_previous_weight,
+        position_window_size=args.pose_position_window,
+    )
     visualizer = GraspVisualizer(
         enabled=not args.no_visualization,
         camera_frame_size=args.camera_coordinate_size,
@@ -194,12 +202,18 @@ def run(args: argparse.Namespace) -> None:
     )
 
     captured_frames = 0
+    last_valid_cloud = None
+    last_valid_grasp = None
     try:
         with RealSenseCamera(
             width=args.width,
             height=args.height,
             fps=args.fps,
             serial_number=args.serial,
+            enable_depth_postprocessing=(
+                not args.disable_realsense_depth_filters
+            ),
+            decimation_magnitude=args.decimation_magnitude,
         ) as camera:
             intrinsic = camera.intrinsic.copy()
             print("RealSense: {} (serial={})".format(
@@ -246,8 +260,38 @@ def run(args: argparse.Namespace) -> None:
                         depth_mm, apple_mask
                     )
 
+                mask_pixels, valid_depth_pixels, valid_ratio = (
+                    calculate_valid_depth_ratio(
+                        filtered_depth_mm,
+                        apple_mask,
+                        min_depth_mm=args.min_depth * 1000.0,
+                        max_depth_mm=args.max_depth * 1000.0,
+                    )
+                )
+                if valid_ratio < args.min_valid_depth_ratio:
+                    if captured_frames % args.log_interval == 0:
+                        print(
+                            "Frame {}: depth invalid ratio {:.1%} "
+                            "({}/{}) - holding last valid grasp".format(
+                                captured_frames,
+                                valid_ratio,
+                                valid_depth_pixels,
+                                mask_pixels,
+                            )
+                        )
+                    if not update_views(
+                        visualizer,
+                        not args.no_visualization,
+                        rgb,
+                        apple_mask,
+                        last_valid_cloud,
+                        last_valid_grasp,
+                        "Low depth ratio - holding last grasp",
+                    ):
+                        break
+                    continue
+
                 valid_mask = build_valid_mask(filtered_depth_mm, apple_mask)
-                valid_depth_pixels = int(valid_mask.sum())
                 if valid_depth_pixels == 0:
                     print("Frame {}: apple mask has no valid depth".format(
                         captured_frames
@@ -300,9 +344,9 @@ def run(args: argparse.Namespace) -> None:
                         not args.no_visualization,
                         rgb,
                         apple_mask,
-                        None,
-                        None,
-                        "Point cloud rejected",
+                        last_valid_cloud,
+                        last_valid_grasp,
+                        "Cloud too sparse - holding last grasp",
                     ):
                         break
                     continue
@@ -336,6 +380,8 @@ def run(args: argparse.Namespace) -> None:
                 # GraspSelector initially persists the raw network result;
                 # overwrite it with the pose actually exposed downstream.
                 grasp_selector.save(filtered_best_grasp)
+                last_valid_cloud = raw_apple_cloud
+                last_valid_grasp = filtered_best_grasp
                 elapsed_ms = (time.perf_counter() - iteration_start) * 1000.0
                 fps = 1000.0 / max(elapsed_ms, 1e-6)
                 if captured_frames % args.log_interval == 0:
@@ -343,6 +389,7 @@ def run(args: argparse.Namespace) -> None:
                         captured_frames,
                         fps,
                         int(apple_mask.sum()),
+                        valid_ratio,
                         cloud_stats.real_points,
                         len(model_cloud.points),
                         filtered_best_grasp,
@@ -397,7 +444,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--serial", default=None, help="Optional RealSense serial number")
+    parser.add_argument(
+        "--serial", default=None, help="Optional RealSense serial number"
+    )
     parser.add_argument("--num-points", type=int, default=20000)
     parser.add_argument(
         "--workspace-roi",
@@ -410,16 +459,47 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-depth",
         type=float,
-        default=None,
-        help="Optional minimum workspace depth in metres",
+        default=0.25,
+        help="Minimum valid workspace depth in metres (default: 0.25)",
     )
     parser.add_argument(
         "--max-depth",
         type=float,
-        default=None,
-        help="Optional maximum workspace depth in metres",
+        default=2.0,
+        help="Maximum valid workspace depth in metres (default: 2.0)",
     )
-    parser.add_argument("--disable-depth-preprocessing", action="store_true")
+    parser.add_argument(
+        "--min-valid-depth-ratio",
+        type=float,
+        default=0.20,
+        help="Skip inference below this valid-depth/mask ratio",
+    )
+    parser.add_argument(
+        "--disable-realsense-depth-filters",
+        action="store_true",
+        help="Disable SDK spatial/temporal/hole-filling filters",
+    )
+    parser.add_argument(
+        "--decimation-magnitude",
+        type=int,
+        default=1,
+        choices=range(1, 9),
+        help="RealSense decimation factor; 1 preserves all depth pixels",
+    )
+    cpu_depth_group = parser.add_mutually_exclusive_group()
+    cpu_depth_group.add_argument(
+        "--enable-depth-preprocessing",
+        dest="enable_cpu_depth_preprocessing",
+        action="store_true",
+        help="Enable additional CPU depth filtering after RealSense filters",
+    )
+    cpu_depth_group.add_argument(
+        "--disable-depth-preprocessing",
+        dest="enable_cpu_depth_preprocessing",
+        action="store_false",
+        help="Compatibility option; CPU depth filtering is disabled by default",
+    )
+    parser.set_defaults(enable_cpu_depth_preprocessing=False)
     parser.add_argument("--disable-median-filter", action="store_true")
     parser.add_argument("--depth-median-kernel", type=int, default=3)
     parser.add_argument("--disable-spatial-smoothing", action="store_true")
@@ -464,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--normal-radius", type=float, default=0.01)
     parser.add_argument("--normal-max-nn", type=int, default=30)
     parser.add_argument("--min-real-points-warning", type=int, default=8000)
-    parser.add_argument("--min-real-points-reject", type=int, default=8000)
+    parser.add_argument("--min-real-points-reject", type=int, default=2048)
     parser.add_argument(
         "--sampling-seed",
         type=int,
@@ -493,19 +573,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--disable-pose-filter",
         action="store_true",
-        help="Disable position EMA and rotation Slerp for A/B comparison",
+        help="Disable position moving average and rotation Slerp",
     )
     parser.add_argument(
         "--pose-previous-weight",
         type=float,
         default=0.7,
-        help="Previous-pose EMA/Slerp weight",
+        help="Previous-rotation weight used by incremental Slerp",
+    )
+    parser.add_argument(
+        "--pose-position-window",
+        type=int,
+        default=5,
+        help="Moving-average window for valid grasp positions",
     )
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument(
         "--coordinate-size",
         type=float,
-        default=0.06,
+        default=0.18,
         help="Best-grasp coordinate-frame size in metres",
     )
     parser.add_argument(
@@ -517,7 +603,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--approach-length",
         type=float,
-        default=0.10,
+        default=0.20,
         help="Displayed grasp approach-arrow length in metres",
     )
     parser.add_argument(
