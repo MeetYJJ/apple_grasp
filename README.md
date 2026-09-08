@@ -455,8 +455,9 @@ python test_realtime_grasp.py \
 version, but is ignored; the displayed grasp frame is dynamic and is
 controlled by `--grasp-frame-scale`.
 
-The camera framing uses a 40% padding around the combined apple, grasp-frame,
-and approach-arrow bounds. Its default target apple fraction is `0.65`; the
+The camera framing uses a 2.5x padded range around the combined apple,
+grasp-frame, and approach-arrow bounds. Its default target apple fraction is
+`0.65`; the
 grasp frame is dynamically `0.8 * apple_bbox_size`, and the approach arrow is
 limited to `1.2 * apple_bbox_size` (or the configured `--approach-length`,
 whichever is smaller). These values can be tuned without changing GraspNet:
@@ -464,7 +465,7 @@ whichever is smaller). These values can be tuned without changing GraspNet:
 ```bash
 python test_realtime_grasp.py \
   --yolo-device 0 \
-  --view-padding 1.40 \
+  --view-padding 2.50 \
   --target-apple-fraction 0.65 \
   --grasp-frame-scale 0.80 \
   --approach-apple-ratio 1.20

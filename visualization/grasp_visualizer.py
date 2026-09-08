@@ -70,7 +70,7 @@ class GraspVisualizer:
         grasp_frame_size: Optional[float] = None,
         approach_length: float = 0.20,
         auto_track: bool = True,
-        view_padding: float = 1.40,
+        view_padding: float = 2.50,
         target_apple_fraction: float = 0.65,
         grasp_frame_scale: float = 0.80,
         approach_apple_ratio: float = 1.20,
@@ -112,6 +112,8 @@ class GraspVisualizer:
         self.last_apple_bbox_size: Optional[float] = None
         self.last_combined_bbox: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.last_view_zoom: Optional[float] = None
+        self.last_padded_scene_size: Optional[float] = None
+        self.last_camera_distance: Optional[float] = None
         self.last_grasp_frame_size: Optional[float] = None
         self.last_approach_length: Optional[float] = None
 
@@ -375,18 +377,42 @@ class GraspVisualizer:
         combined_size = max(float(np.max(combined_max - combined_min)),
                             self._minimum_display_size())
         padded_size = combined_size * self.view_padding
+        self.last_padded_scene_size = padded_size
 
-        # Open3D zoom is normalized to the current scene bounds. The ratio
-        # below keeps the apple near the requested 60--70% visual scale while
-        # reserving the remaining area for the frame and approach arrow.
+        # Recompute the Visualizer bounding box after the persistent geometry
+        # has moved. This does not recreate or remove any geometry, but makes
+        # Open3D's normalized zoom refer to the current scene rather than to a
+        # stale first-frame box.
+        reset_view_point = getattr(self._visualizer, "reset_view_point", None)
+        if callable(reset_view_point):
+            reset_view_point(True)
+
+        # A larger/padded combined scene must move the camera farther away.
+        # Open3D's zoom increases camera distance; keep it in the conservative
+        # range requested for this application so the camera cannot enter the
+        # apple. The reference padding is 2.5x, so the default target fraction
+        # maps to a 0.40 baseline zoom and changing padding remains effective.
+        padding_ratio = padded_size / (2.50 * combined_size)
         zoom = float(np.clip(
-            self.target_apple_fraction * apple_size / padded_size,
-            0.05,
-            0.8,
+            0.40
+            * (self.target_apple_fraction / 0.65)
+            * np.sqrt(padding_ratio)
+            * np.sqrt(combined_size / apple_size),
+            0.30,
+            0.50,
         ))
+        # At the default 60 degree FOV, fitting half the padded extent uses
+        # distance = padded_extent / (2*tan(FOV/2)). This is the desired
+        # scene-space distance; Open3D's internal distance also includes the
+        # fixed camera-frame geometry in its bounding box.
+        self.last_camera_distance = padded_size / (
+            2.0 * np.tan(np.deg2rad(30.0))
+        )
         self.last_view_zoom = zoom
         view = self._visualizer.get_view_control()
         view.set_lookat(centroid.tolist())
+        # The camera is placed on the sensor side (-Z) and looks toward +Z,
+        # which keeps the default view outside an apple in the D435i frame.
         view.set_front([0.0, 0.0, -1.0])
         view.set_up([0.0, -1.0, 0.0])
         view.set_zoom(zoom)

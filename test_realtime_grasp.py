@@ -613,8 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--view-padding",
         type=float,
-        default=1.40,
-        help="Combined-scene view padding factor (default: 1.40)",
+        default=2.50,
+        help="Combined-scene view padding factor (default: 2.50)",
     )
     parser.add_argument(
         "--target-apple-fraction",
