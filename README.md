@@ -45,7 +45,7 @@ the current stage.
 - `grasp/grasp_pose_filter.py`: filters translation with a moving average and
   rotation with SO(3) Slerp; it never averages rotation-matrix elements.
 - `visualization/grasp_visualizer.py`: updates the Open3D cloud, camera frame,
-  grasp frame, and grasp-approach arrow.
+  grasp frame, grasp-approach arrow, and combined-scene camera framing.
 
 `AppleMaskDetector` currently uses a simple red-region heuristic so that the
 pipeline can be exercised without a model. It is not a trained apple detector
@@ -411,8 +411,9 @@ T_camera_grasp = [ R  t ]
 
 Coordinate-frame axes use the Open3D convention: x is red, y is green, and z
 is blue. The Open3D view looks at the current cloud centroid and derives zoom
-from its bounding-box extent, so the apple remains prominent as distance
-changes. Point cloud, bounding box, grasp frame, and approach arrow objects are
+from the combined point-cloud, grasp-frame, and approach-arrow bounds, so the
+apple remains prominent as distance changes. Point cloud, bounding box, grasp
+frame, and approach arrow objects are
 allocated once and subsequently changed with `update_geometry()`; no geometry
 is removed and recreated per frame. By default the terminal prints one compact
 report every ten captured frames: frame number, FPS, mask pixels, valid-depth
@@ -447,8 +448,26 @@ Visualization sizes can be adjusted without changing inference:
 python test_realtime_grasp.py \
   --yolo-device 0 \
   --camera-coordinate-size 0.10 \
-  --coordinate-size 0.18 \
   --approach-length 0.20
+```
+
+`--coordinate-size` remains accepted for scripts written against the previous
+version, but is ignored; the displayed grasp frame is dynamic and is
+controlled by `--grasp-frame-scale`.
+
+The camera framing uses a 40% padding around the combined apple, grasp-frame,
+and approach-arrow bounds. Its default target apple fraction is `0.65`; the
+grasp frame is dynamically `0.8 * apple_bbox_size`, and the approach arrow is
+limited to `1.2 * apple_bbox_size` (or the configured `--approach-length`,
+whichever is smaller). These values can be tuned without changing GraspNet:
+
+```bash
+python test_realtime_grasp.py \
+  --yolo-device 0 \
+  --view-padding 1.40 \
+  --target-apple-fraction 0.65 \
+  --grasp-frame-scale 0.80 \
+  --approach-apple-ratio 1.20
 ```
 
 ## Motion-adaptive realtime filtering

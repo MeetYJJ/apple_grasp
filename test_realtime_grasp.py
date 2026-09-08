@@ -112,8 +112,6 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("--num-points must be at least 2048")
     if args.max_frames < 0:
         raise ValueError("--max-frames must be non-negative")
-    if args.coordinate_size <= 0:
-        raise ValueError("--coordinate-size must be positive")
     if args.camera_coordinate_size <= 0:
         raise ValueError("--camera-coordinate-size must be positive")
     if args.approach_length <= 0:
@@ -187,8 +185,11 @@ def run(args: argparse.Namespace) -> None:
     visualizer = GraspVisualizer(
         enabled=not args.no_visualization,
         camera_frame_size=args.camera_coordinate_size,
-        grasp_frame_size=args.coordinate_size,
         approach_length=args.approach_length,
+        view_padding=args.view_padding,
+        target_apple_fraction=args.target_apple_fraction,
+        grasp_frame_scale=args.grasp_frame_scale,
+        approach_apple_ratio=args.approach_apple_ratio,
     )
 
     print("YOLO model: {}".format(yolo_backend.model_path))
@@ -591,8 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--coordinate-size",
         type=float,
-        default=0.18,
-        help="Best-grasp coordinate-frame size in metres",
+        default=None,
+        help=(
+            "Legacy option retained for CLI compatibility; actual frame size "
+            "follows apple bbox"
+        ),
     )
     parser.add_argument(
         "--camera-coordinate-size",
@@ -605,6 +609,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.20,
         help="Displayed grasp approach-arrow length in metres",
+    )
+    parser.add_argument(
+        "--view-padding",
+        type=float,
+        default=1.40,
+        help="Combined-scene view padding factor (default: 1.40)",
+    )
+    parser.add_argument(
+        "--target-apple-fraction",
+        type=float,
+        default=0.65,
+        help="Target apple visual fraction used for camera zoom",
+    )
+    parser.add_argument(
+        "--grasp-frame-scale",
+        type=float,
+        default=0.80,
+        help="Grasp frame size as a fraction of apple bbox size",
+    )
+    parser.add_argument(
+        "--approach-apple-ratio",
+        type=float,
+        default=1.20,
+        help="Maximum approach-arrow length as an apple-size ratio",
     )
     parser.add_argument(
         "--max-frames",

@@ -54,7 +54,9 @@ class GraspVisualizer:
     ``point_cloud`` passed to :meth:`update` may be the pipeline's
     ``PointCloudData``, an Open3D point cloud, or an ``(N, 3)`` NumPy array.
     All positions and point coordinates are expected in metres in the camera
-    frame.
+    frame. ``grasp_frame_size`` is retained for backwards compatibility; the
+    displayed grasp frame is now scaled from the current apple bbox using
+    ``grasp_frame_scale``.
     """
 
     def __init__(
@@ -65,26 +67,53 @@ class GraspVisualizer:
         height: int = 720,
         point_size: float = 4.0,
         camera_frame_size: float = 0.10,
-        grasp_frame_size: float = 0.18,
+        grasp_frame_size: Optional[float] = None,
         approach_length: float = 0.20,
         auto_track: bool = True,
+        view_padding: float = 1.40,
+        target_apple_fraction: float = 0.65,
+        grasp_frame_scale: float = 0.80,
+        approach_apple_ratio: float = 1.20,
     ) -> None:
         if width <= 0 or height <= 0:
             raise ValueError("window width and height must be positive")
         if point_size <= 0:
             raise ValueError("point_size must be positive")
-        if camera_frame_size <= 0 or grasp_frame_size <= 0:
+        if camera_frame_size <= 0:
             raise ValueError("coordinate-frame sizes must be positive")
+        if grasp_frame_size is not None and grasp_frame_size <= 0:
+            raise ValueError("legacy grasp_frame_size must be positive")
         if approach_length <= 0:
             raise ValueError("approach_length must be positive")
+        if view_padding < 1.0:
+            raise ValueError("view_padding must be at least 1.0")
+        if not 0.0 < target_apple_fraction <= 1.0:
+            raise ValueError("target_apple_fraction must be in (0, 1]")
+        if grasp_frame_scale <= 0:
+            raise ValueError("grasp_frame_scale must be positive")
+        if approach_apple_ratio <= 0:
+            raise ValueError("approach_apple_ratio must be positive")
 
         self.enabled = bool(enabled)
         self.camera_frame_size = float(camera_frame_size)
-        self.grasp_frame_size = float(grasp_frame_size)
+        # Public compatibility attribute; dynamic sizing below deliberately
+        # does not use this legacy fixed-size value.
+        self.grasp_frame_size = (
+            None if grasp_frame_size is None else float(grasp_frame_size)
+        )
         self.approach_length = float(approach_length)
         self.auto_track = bool(auto_track)
+        self.view_padding = float(view_padding)
+        self.target_apple_fraction = float(target_apple_fraction)
+        self.grasp_frame_scale = float(grasp_frame_scale)
+        self.approach_apple_ratio = float(approach_apple_ratio)
         self.last_grasp_transform: Optional[np.ndarray] = None
         self.last_approach_direction: Optional[np.ndarray] = None
+        self.last_apple_bbox_size: Optional[float] = None
+        self.last_combined_bbox: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        self.last_view_zoom: Optional[float] = None
+        self.last_grasp_frame_size: Optional[float] = None
+        self.last_approach_length: Optional[float] = None
 
         self._o3d = None
         self._visualizer = None
@@ -142,7 +171,7 @@ class GraspVisualizer:
         if not self.enabled:
             return True
 
-        self._update_point_cloud(point_cloud)
+        points = self._update_point_cloud(point_cloud)
 
         if position is not None and rotation is not None:
             transform = build_grasp_transform(position, rotation)
@@ -150,8 +179,16 @@ class GraspVisualizer:
             self.last_grasp_transform = transform.copy()
             self.last_approach_direction = approach.copy()
 
-            self._update_grasp_frame(transform)
-            self._update_approach_arrow(transform[:3, 3], approach)
+            apple_size = self.last_apple_bbox_size
+            if points is not None:
+                apple_size = self._apple_bbox_size(points)
+            if apple_size is None:
+                apple_size = self._minimum_display_size()
+            self._update_grasp_frame(transform, apple_size)
+            self._update_approach_arrow(transform[:3, 3], approach, apple_size)
+
+        if points is not None and self.auto_track:
+            self._update_view(points)
 
         window_alive = self._visualizer.poll_events()
         self._visualizer.update_renderer()
@@ -164,9 +201,9 @@ class GraspVisualizer:
             self._visualizer.destroy_window()
             self._visualizer = None
 
-    def _update_point_cloud(self, point_cloud: Optional[Any]) -> None:
+    def _update_point_cloud(self, point_cloud: Optional[Any]) -> Optional[np.ndarray]:
         if point_cloud is None:
-            return
+            return None
 
         points, colors = self._extract_cloud_arrays(point_cloud)
         self._point_cloud.points = self._o3d.utility.Vector3dVector(points)
@@ -184,14 +221,24 @@ class GraspVisualizer:
             self._visualizer.update_geometry(self._point_cloud)
 
         self._update_bounding_box(points)
-        if self.auto_track:
-            self._update_view(points)
+        self.last_apple_bbox_size = self._apple_bbox_size(points)
+        return points
 
-    def _update_grasp_frame(self, transform: np.ndarray) -> None:
+    def _update_grasp_frame(
+        self, transform: np.ndarray, apple_bbox_size: Optional[float] = None
+    ) -> None:
+        apple_bbox_size = self._resolve_apple_bbox_size(apple_bbox_size)
+        frame_size = max(
+            float(apple_bbox_size) * self.grasp_frame_scale,
+            self._minimum_display_size(),
+        )
+        self.last_grasp_frame_size = frame_size
         if self._grasp_frame is None:
             self._grasp_frame = (
                 self._o3d.geometry.TriangleMesh.create_coordinate_frame(
-                    size=self.grasp_frame_size
+                    # Keep a unit template. Its vertices are scaled to the
+                    # current apple bbox on every frame below.
+                    size=1.0
                 )
             )
             self._grasp_vertices = np.asarray(
@@ -203,7 +250,9 @@ class GraspVisualizer:
 
         rotation = transform[:3, :3]
         translation = transform[:3, 3]
-        vertices = self._grasp_vertices @ rotation.T + translation
+        vertices = (
+            self._grasp_vertices * frame_size
+        ) @ rotation.T + translation
         normals = self._grasp_normals @ rotation.T
         self._grasp_frame.vertices = self._o3d.utility.Vector3dVector(vertices)
         self._grasp_frame.vertex_normals = self._o3d.utility.Vector3dVector(
@@ -218,13 +267,25 @@ class GraspVisualizer:
             self._visualizer.update_geometry(self._grasp_frame)
 
     def _update_approach_arrow(
-        self, position: np.ndarray, approach: np.ndarray
+        self,
+        position: np.ndarray,
+        approach: np.ndarray,
+        apple_bbox_size: Optional[float] = None,
     ) -> None:
-        cone_height = self.approach_length * 0.25
-        cylinder_height = self.approach_length - cone_height
-        cylinder_radius = max(self.approach_length * 0.025, 0.001)
-        cone_radius = cylinder_radius * 2.0
+        apple_bbox_size = self._resolve_apple_bbox_size(apple_bbox_size)
+        # Treat the configured value as a maximum. A very small apple should
+        # not be framed by an arrow several times larger than the target.
+        display_length = min(
+            self.approach_length,
+            max(float(apple_bbox_size) * self.approach_apple_ratio,
+                self._minimum_display_size()),
+        )
+        self.last_approach_length = display_length
         if self._approach_arrow is None:
+            cone_height = 0.25
+            cylinder_height = 0.75
+            cylinder_radius = 0.025
+            cone_radius = cylinder_radius * 2.0
             self._approach_arrow = self._o3d.geometry.TriangleMesh.create_arrow(
                 cylinder_radius=cylinder_radius,
                 cone_radius=cone_radius,
@@ -243,8 +304,9 @@ class GraspVisualizer:
         # Open3D arrows point along +Z. Place the tail behind the target so the
         # yellow arrow points along grasp +X and its tip ends at the grasp point.
         align_rotation = self._rotation_from_z_axis(approach)
-        tail = position - approach * self.approach_length
-        vertices = self._arrow_vertices @ align_rotation.T + tail
+        tail = position - approach * display_length
+        vertices = self._arrow_vertices * display_length
+        vertices = vertices @ align_rotation.T + tail
         normals = self._arrow_normals @ align_rotation.T
         self._approach_arrow.vertices = self._o3d.utility.Vector3dVector(
             vertices
@@ -295,24 +357,60 @@ class GraspVisualizer:
 
     def _update_view(self, points: np.ndarray) -> None:
         centroid = points.mean(axis=0)
-        extent = points.max(axis=0) - points.min(axis=0)
-        object_size = max(float(np.max(extent)), 0.01)
-        focus_size = max(
-            object_size, self.grasp_frame_size, self.approach_length
-        )
-        # Open3D's zoom is relative to the full scene bounding box, which also
-        # contains the coordinate frame at the camera origin. Compensate for
-        # that camera-to-object span so it cannot make the apple look tiny.
-        scene_span = max(
-            float(np.linalg.norm(centroid)) + self.camera_frame_size,
-            focus_size,
-        )
-        zoom = float(np.clip(focus_size / (0.75 * scene_span), 0.05, 0.8))
+        apple_min = points.min(axis=0)
+        apple_max = points.max(axis=0)
+        scene_parts = [points]
+        if self._grasp_frame is not None:
+            scene_parts.append(np.asarray(self._grasp_frame.vertices))
+        if self._approach_arrow is not None:
+            scene_parts.append(np.asarray(self._approach_arrow.vertices))
+
+        combined = np.concatenate(scene_parts, axis=0)
+        combined_min = combined.min(axis=0)
+        combined_max = combined.max(axis=0)
+        self.last_combined_bbox = (combined_min.copy(), combined_max.copy())
+
+        apple_size = max(float(np.max(apple_max - apple_min)),
+                         self._minimum_display_size())
+        combined_size = max(float(np.max(combined_max - combined_min)),
+                            self._minimum_display_size())
+        padded_size = combined_size * self.view_padding
+
+        # Open3D zoom is normalized to the current scene bounds. The ratio
+        # below keeps the apple near the requested 60--70% visual scale while
+        # reserving the remaining area for the frame and approach arrow.
+        zoom = float(np.clip(
+            self.target_apple_fraction * apple_size / padded_size,
+            0.05,
+            0.8,
+        ))
+        self.last_view_zoom = zoom
         view = self._visualizer.get_view_control()
         view.set_lookat(centroid.tolist())
         view.set_front([0.0, 0.0, -1.0])
         view.set_up([0.0, -1.0, 0.0])
         view.set_zoom(zoom)
+
+    @staticmethod
+    def _minimum_display_size() -> float:
+        return 1e-4
+
+    def _resolve_apple_bbox_size(self, apple_bbox_size: Optional[float]) -> float:
+        if apple_bbox_size is not None:
+            return max(float(apple_bbox_size), self._minimum_display_size())
+        if self.last_apple_bbox_size is not None:
+            return self.last_apple_bbox_size
+        if self.grasp_frame_size is not None:
+            return max(
+                self.grasp_frame_size / self.grasp_frame_scale,
+                self._minimum_display_size(),
+            )
+        return self._minimum_display_size()
+
+    @staticmethod
+    def _apple_bbox_size(points: np.ndarray) -> float:
+        extent = np.max(points, axis=0) - np.min(points, axis=0)
+        return max(float(np.max(extent)), GraspVisualizer._minimum_display_size())
 
     @staticmethod
     def _rotation_from_z_axis(direction: np.ndarray) -> np.ndarray:
